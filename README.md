@@ -137,6 +137,19 @@ CMD ["python", "bot/main.py"]
 deploy, so a DB outside the volume means the season is silently erased at your next push.
 `python bot/main.py --check` prints a warning when the DB is not on `/data`.
 
+### If the build fails
+
+| log line | cause | fix |
+|---|---|---|
+| `invalid type: map, expected a sequence for key 'providers'` | an old `nixpacks.toml` from before this fix, still in your working copy | delete `nixpacks.toml`; it is not needed |
+| `Python version 3.13 is not supported` / it installs an old Python anyway | this deploy's Nixpacks (1.41) resolves versions from its Nixpkgs snapshot, which I cannot query from here | change `runtime.txt` and `.python-version` to `3.12` — one line, then redeploy. Or set `NIXPACKS_PYTHON_VERSION` and delete both files |
+| `ModuleNotFoundError: No module named 'discord'` | requirements not picked up | check the service root is the **repo root**, not `bot/` |
+
+The middle row is the only build risk I could not eliminate from here: I verified the Python the suite
+runs on (3.13.14) but not which versions Railway's image offers. The code needs **3.9+** — only
+`zoneinfo` (`bot/services.py:22`) sets the floor — so 3.10, 3.11 or 3.12 are all fine if 3.13 is
+unavailable. Nothing in `bot/` or `engine/` uses a 3.12/3.13-only feature.
+
 **`.dockerignore` is the ignore file Railway honours** — not `.railwayignore`, which is
 undocumented and only ever applied by the CLI uploader. It keeps `*.db`, `tests/` and `sim/` out of
 the build context, because a `hub.db` baked into an image can resurface over the volume and reads
