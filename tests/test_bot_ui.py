@@ -841,5 +841,114 @@ check("…and still refuses a player",
       is False)
 
 
+# --- 12. the /setup dead-ends a live server hit ---------------------------- #
+# Symptom, all three at once: "the bot didn't respond in time", no channels created, and
+# an empty Railway log. Three separate defects produced it; each check below fails on the
+# code as it was shipped.
+
+# (a) interaction_check used is_staff(user) with NO stored id, so it fell back to matching
+#     the literal role name "Hub Staff". _authorized() had already been fixed for exactly
+#     this, but the dispatcher runs interaction_check FIRST - so on a server whose staff
+#     role is named anything else (the norm: the picker exists to choose it), every staff
+#     control refused before its callback ever ran. Including "Create everything".
+_renamed = type("U", (), {"id": 9, "roles": [_role],
+                          "guild_permissions": type("P", (), {"administrator": False})()})()
+check("interaction_check honours the STORED role id, not the name 'Hub Staff'",
+      asyncio.run(ui.HubView(_conn, staff=True).interaction_check(_GateI(_renamed))) is True,
+      "staff_role_id=777 is stored and the user holds role 777")
+check("…and interaction_check still refuses a genuine outsider",
+      asyncio.run(ui.HubView(_conn, staff=True).interaction_check(
+          _GateI(type("U", (), {"id": 8, "roles": [],
+                                "guild_permissions": type("P", (), {"administrator": False})()})())))
+      is False)
+
+# (b) The owner bypass never fired. It compared interaction.user.id against
+#     message.author.id - but a bot's ephemeral message is authored by the BOT, so that
+#     comparison was bot-id vs human-id and False on every real click. Consequence: the
+#     FIRST /setup on a fresh server (no staff_role_id yet) could not be confirmed by the
+#     non-admin who ran it. Discord's own answer is interaction_metadata.user.
+class _OwnedMsg:
+    """A bot-authored ephemeral carrying the metadata Discord really sends."""
+    def __init__(self, invoker_id, bot_id=424242):
+        self.id = 5001
+        self.author = type("A", (), {"id": bot_id})()
+        self.interaction_metadata = type("IM", (), {"user": type("U", (), {"id": invoker_id})()})()
+
+
+class _OwnerI:
+    def __init__(self, user, msg):
+        self.user, self.message, self.response = user, msg, Resp()
+
+
+_nobody = type("U", (), {"id": 4242, "roles": [],
+                         "guild_permissions": type("P", (), {"administrator": False})()})()
+_blank = D.connect(":memory:")          # a server that has NEVER run /setup
+check("the owner bypass reads interaction_metadata, not the bot's own author id",
+      ui.gate(_OwnerI(_nobody, _OwnedMsg(4242)), _blank, owner_bypass=True) is True,
+      "the human who ran /setup must be able to press their own confirm button")
+check("…and it is still nobody else's button",
+      ui.gate(_OwnerI(_nobody, _OwnedMsg(999)), _blank, owner_bypass=True) is False)
+check("the confirm view carries that bypass, so the FIRST /setup is completable",
+      ui.SetupProvisionView(_blank).owner_bypass is True
+      and asyncio.run(ui.SetupProvisionView(_blank).interaction_check(
+          _OwnerI(_nobody, _OwnedMsg(4242)))) is True,
+      "no staff role is stored yet at the moment this button is pressed")
+check("…while a passer-by still cannot press it",
+      asyncio.run(ui.SetupProvisionView(_blank).interaction_check(
+          _OwnerI(_nobody, _OwnedMsg(999)))) is False)
+
+# (c) A view that has been stop()ed is unregistered from the dispatcher, and discord.py
+#     drops the click before the callback: `_dispatch_item` returns None when the view is
+#     finished. main.py called view.stop() on the picker whenever a staff role was already
+#     stored, so every /setup mode:SETUP after the first rendered a live-looking dropdown
+#     that did nothing at all - no reply, no channels, no log line.
+_dead = discord.ui.View(timeout=None)
+_dead.add_item(ui.StaffRoleSelect(_conn))
+
+
+async def _dispatch_is_dropped(view):
+    view.stop()
+    return view._dispatch_item(view.children[0], None) is None
+
+
+check("a stopped view silently drops the click (why stop()ing the picker killed re-runs)",
+      asyncio.run(_dispatch_is_dropped(_dead)) is True,
+      "this is the discord.py behaviour the fix in main.py avoids")
+
+# (d) HubView.on_error swallowed everything that was not an HTTPException, and logged
+#     nothing. A callback that deferred and then raised hit InteractionResponded (a
+#     ClientException) inside the handler itself: no user message, no Railway line, just a
+#     spinner. It must now log AND answer through reply(), which tolerates a used token.
+import logging as _logging
+
+
+class _Rec(_logging.Handler):
+    def __init__(self): super().__init__(); self.records = []
+    def emit(self, r): self.records.append(r)
+
+
+class _DeferredI:
+    """Already answered, exactly as a callback that deferred then raised leaves it."""
+    def __init__(self):
+        self.user = _renamed
+        self.response = type("R", (), {"is_done": lambda self: True})()
+        self.edits = []
+
+    async def edit_original_response(self, **kw):
+        self.edits.append(kw)
+
+
+_rec = _Rec()
+_logging.getLogger("hub").addHandler(_rec)
+_di = _DeferredI()
+asyncio.run(ui.HubView(_conn, staff=True).on_error(
+    _di, discord.Forbidden.__new__(discord.Forbidden), _dead.children[0]))
+_logging.getLogger("hub").removeHandler(_rec)
+check("a failing control is written to the log instead of vanishing",
+      any(r.levelno >= _logging.ERROR and r.exc_info for r in _rec.records),
+      f"records={[r.getMessage() for r in _rec.records]}")
+check("…and the user is told, through the path that survives an already-used token",
+      len(_di.edits) == 1 and "failed" in str(_di.edits[0].get("content")), str(_di.edits))
+
 
 print(f"\n{ok} UI checks passed.")

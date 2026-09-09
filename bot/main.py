@@ -442,9 +442,15 @@ def build_tree(bot: HubBot) -> None:
                 i, conn, D.cfg(conn, "staff_role_id") or 0))
         if mode == "status":
             return await ui.reply(i, embed=_setup_status(conn, i.guild))
+        # NO view.stop() here. It used to be called when a staff role was already stored,
+        # on the theory that SETUP would "only re-confirm" it - but stop() is what
+        # UNREGISTERS a view from the dispatcher, and discord.py drops the click of any
+        # item whose view is finished (`_dispatch_item` returns None before the callback
+        # runs). The dropdown still rendered and was still tappable, so the second and
+        # every later /setup mode:SETUP looked alive, answered nothing, created nothing
+        # and logged nothing - exactly "the bot didn't respond in time" with an empty
+        # deploy log. A re-run has to work: it is how a deleted channel gets rebuilt.
         view = _SetupAskView(conn)
-        if D.cfg(conn, "staff_role_id"):
-            view.stop()      # already wired; SETUP would only re-confirm it
         await ui.reply(i, view=view,
                        content="Which role should **run the quizzes**? Its members get every "
                                "staff control, and the id is stored - renaming that role later "
@@ -760,7 +766,17 @@ def main() -> int:
     ap.add_argument("--setup", action="store_true")
     ap.add_argument("--check", action="store_true", help="verify config and exit")
     args = ap.parse_args()
-    logging.basicConfig(level=logging.INFO,
+    # Railway captures the container's stdout/stderr through a pipe, not a terminal, and
+    # Python block-buffers a pipe in 8 KB chunks. A bot that logs a few hundred bytes an
+    # hour therefore shows a COMPLETELY EMPTY deploy log for hours while running perfectly
+    # - which is exactly what "railway log empty" looks like, and it hides every message
+    # below. Line buffering costs nothing at this volume and makes the log truthful.
+    for stream in (sys.stdout, sys.stderr):
+        try:
+            stream.reconfigure(line_buffering=True)
+        except (AttributeError, ValueError):
+            pass
+    logging.basicConfig(level=logging.INFO, stream=sys.stdout,
                         format="%(asctime)s %(levelname)s %(name)s: %(message)s")
     if args.setup:
         print(SETUP_NOTES)
@@ -814,7 +830,10 @@ def main() -> int:
               "  export HUB_TOKEN=...\n  python3 bot/main.py --db hub.db\n"
               "Run --setup for the full checklist.")
         return 2
-    bot.run(token)
+    # log_handler=None: discord.py otherwise installs a SECOND handler on the "discord"
+    # logger, which still propagates to the root handler basicConfig just made - every
+    # gateway line printed twice, in two different formats. One configuration, ours.
+    bot.run(token, log_handler=None)
     return 0
 
 

@@ -156,6 +156,32 @@ def main() -> int:
           {"AnswerView", "SubmitView", "HubPanelView", "SetupProvisionView"} <= views,
           str(sorted(views)))
 
+    # ---------------------------------------- /setup must survive being run a second time
+    # The picker was stop()ed whenever a staff role was already stored. A stopped view is
+    # unregistered from the dispatcher and discord.py discards the click BEFORE the
+    # callback (`_dispatch_item` returns None on a finished view) - so every /setup
+    # mode:SETUP after the first showed a dropdown that answered nothing and logged
+    # nothing. Re-running it is the documented repair for a deleted channel, so it has to
+    # work. The source is the assertion because the guard is the ABSENCE of a call.
+    _src = (ROOT / "bot" / "main.py").read_text()
+    _setup_body = _src[_src.index("async def setup("):_src.index("@setup.error")]
+    # Comments stripped first: the fix documents itself by NAMING view.stop(), and a raw
+    # substring search would match the explanation and fail on correct code.
+    _setup_code = "\n".join(ln.split("#", 1)[0] for ln in _setup_body.splitlines())
+    check("/setup never stops the picker it just sent (that would drop the click)",
+          ".stop()" not in _setup_code, _setup_code[-400:])
+
+    # ------------------------------------------------- the log Railway was not being sent
+    # Railway reads the container's stdout through a pipe, and Python block-buffers a pipe
+    # in 8 KB chunks. A low-volume bot then shows an entirely EMPTY deploy log while it is
+    # running fine - which is what made this bug unreadable from the outside.
+    check("stdout is line-buffered so Railway sees a log at all",
+          "line_buffering=True" in _src, "sys.stdout.reconfigure is missing")
+    check("logging goes to stdout, where Railway collects it",
+          "stream=sys.stdout" in _src)
+    check("discord.py is told not to add a second, duplicate handler",
+          "log_handler=None" in _src, "bot.run() would double every gateway line")
+
     # A bad HUB_DB must produce a diagnosis, not a traceback: Railway shows the first
     # lines of a container that restarts every second, and a stack of `raise ... from exc`
     # frames teaches a volunteer nothing about which variable is wrong.
