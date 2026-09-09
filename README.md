@@ -74,14 +74,21 @@ depends on a human being awake.
 ## Tests
 
 ```bash
-python3 run_tests.py         # all five suites, ~3s, no token needed; non-zero exit on any failure
+python3 run_tests.py         # all seven suites, ~5s, no token needed; non-zero exit on any failure
 
 python3 tests/test_engine.py          #  48  rules: points, bands, tie-breaks, rollover, floor
 python3 tests/test_bot_services.py    # 133  grading, idempotency, restart state, roles, payouts
 python3 tests/test_bot_ui.py          # 108  persistence, layout limits, click paths, permissions
 python3 tests/test_bot_scheduler.py   #  66  auto-post, auto-lock, outage recovery, routing
 python3 tests/test_symbols.py         #  static guard + structural schema checks
+python3 tests/test_deploy.py          #   40  every HUB_DB paste shape, the pooler trap, setup_hook
 ```
+
+`test_deploy.py` is the newest one and exists because of the first live deploy: a paste the parser
+rejected and a persistent view defined in the wrong scope. Neither is reachable from a fake — the
+first needs psycopg's real conninfo grammar, the second needs `setup_hook` to run at all — so both
+are now asserted directly, with the Postgres-only checks skipping loudly (never silently) when no
+server is configured.
 
 Run `run_tests.py` before every deploy. `test_symbols.py` catches two classes of bug that only
 otherwise appear when a player presses a button: cross-module references that resolve to the wrong
@@ -156,9 +163,14 @@ Set it up like this:
 5. Deploy, then run `/setup` again if you are moving an existing season (see below).
 
 Use the pooler **port 6543** (`aws-0-<region>.pooler.supabase.com`) and keep `sslmode=require`.
-`psycopg` is pinned in `requirements.txt` with `prepare_threshold=0` (client-side binds) — that
-is what makes transaction pooling work; server-side prepared statements leak between pooled
-clients and die with `prepared statement "..." already exists`.
+**`prepare_threshold` must be `None`, not `0`.** psycopg's own guard reads
+`if self.prepare_threshold is None`, so `0` skips the disable path and falls through to
+`count >= 0` — which is true for a query's *first* execution. In other words `0` means "prepare
+every query", and under PgBouncer (Supabase's `:6543`) a prepared statement lives on the server,
+outlives our container, and collides: the next boot fails its very first query with
+`prepared statement "_pg3_0" already exists`. `None` is the only value that turns the cache off;
+client-side binds then work normally through transaction pooling. This is not a knob to
+"improve" later by adding a pool — the line is load-bearing.
 
 **Moving an existing season off SQLite:** run `python3 tools/sqlite2pg.py hub.db "postgres://…"`
 **from your own machine** (it needs to reach both the old file and the new server; `tools/` is not
@@ -191,11 +203,17 @@ Nothing else is needed — the start command comes from `railway.json`, the Pyth
 `runtime.txt`, and every other setting (open hour, answer window, point bands, channel/role ids)
 is written into the database by `/setup`, not read from the environment.
 
-Two things the bot now tolerates, because both are easy to paste by accident: Supabase's **JSON**
-"Database connection string" (it will be converted to a URI for you), and a `postgresql://` scheme.
-Anything that is neither a URL nor a recognisable connection object is **refused at boot** rather
-than treated as a filename — silently falling back to `/app/hub.db` is the one outcome where the
-bot looks healthy and still loses the season.
+**What `HUB_DB` tolerates.** All of these are copy/paste results, so all of them work: Supabase's
+**JSON** "Database connection string"; a `postgresql://` URI whose query contains `?database=` or
+`?db=`; keyword text (`database=… ssl=true`, as printed by some consoles); and a scheme mangled by
+`pathlib` (`postgres:/…`). `bot/db.py` acts as a translator rather than a passthrough — it renames
+`database`/`db` to libpq's `dbname`, maps `ssl=true` to a real `sslmode` value, drops keys psycopg
+has never heard of (`driver`, `max_connections`, `description`), and rebuilds the URI — because
+handing any of them to psycopg verbatim is what produced this repo's first crash-loop
+(`invalid connection option "database"`). A value that is still not a connection is **refused at
+boot** rather than treated as a filename: falling back to `/app/hub.db` is the one outcome where
+the bot looks healthy and still loses the season. The failure prints one line naming the key that
+is missing plus what to paste instead, and `tests/test_deploy.py` asserts every shape above.
 
 **If you would rather stay on SQLite:** then yes, **add a Volume and mount it at `/data`**, and
 set `HUB_DB=/data/hub.db`. `python bot/main.py --check` prints a warning when the DB is not on a
@@ -233,6 +251,11 @@ socket to prove the reconnect works.
 | `invalid type: map, expected a sequence for key 'providers'` | an old `nixpacks.toml` from before this fix, still in your working copy | delete `nixpacks.toml`; it is not needed |
 | `Python version 3.13 is not supported` / it installs an old Python anyway | this deploy's Nixpacks (1.41) resolves versions from its Nixpkgs snapshot, which I cannot query from here | change `runtime.txt` and `.python-version` to `3.12` — one line, then redeploy. Or set `NIXPACKS_PYTHON_VERSION` and delete both files |
 | `ModuleNotFoundError: No module named 'discord'` | requirements not picked up | check the service root is the **repo root**, not `bot/` |
+| `invalid connection option "database"` (or `invalid URI query parameter`) repeating every second | `HUB_DB` written as keyword text, or a URI whose query Supabase/Prisma/TypeORM added | fixed as of this release — `db.py` now renames and filters those keys. If you still see it, paste the **URI** (`postgresql://…?sslmode=require`) and nothing else |
+| `prepared statement "_pg3_0" already exists` | `prepare_threshold` was set to `0`, which means *prepare everything* | keep it `None` in **both** connect sites in `bot/db.py`; there is nothing to clear on Supabase — the statements die with the pooler's server connections |
+| `NameError: name '_SetupAskView' is not defined` inside `setup_hook` | a persistent view defined inside `build_tree()`, referenced at module scope before that function ever runs | fixed by moving the class to module scope; `test_deploy.py` now calls `setup_hook` against a stand-in, because this only ever fired on a real gateway login |
+| `FATAL: (ENOTFOUND) tenant/user postgres.<ref> not found` | project ref or pooler user wrong | the user must stay `postgres.<ref>` while Connection Pooling is on; drop the `.ref` only if you turn pooling off and use port 5432 |
+| `invalid sslmode value: "true"` | Supabase's JSON field `ssl` pasted into a conninfo string | `db.py` maps it now; or paste the URI, which says `sslmode=require` |
 
 The middle row is the only build risk I could not eliminate from here: I verified the Python the suite
 runs on (3.13.14) but not which versions Railway's image offers. The code needs **3.9+** — only

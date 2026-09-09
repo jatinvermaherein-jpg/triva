@@ -243,6 +243,78 @@ def _sslmode(raw) -> str:
     return s                                  # verify-full etc. pass through
 
 
+# Supabase's console and Railway both spell "database" where libpq insists on "dbname",
+# and both attach parameters psycopg's parser rejects outright. Kept above _normalise so
+# the accepted-key set lives in exactly one place for every input shape.
+_OPT_ALIASES = {"database": "dbname", "db": "dbname", "ssl": "sslmode",
+                "username": "user", "pass": "password", "pwd": "password"}
+# Real libpq/psycopg conninfo keywords, plus what a pooler legitimately wants.
+_KNOWN_OPTS = {"dbname", "user", "password", "host", "port", "hostaddr", "options",
+               "application_name", "connect_timeout", "sslmode", "sslrootcert", "sslcert",
+               "sslkey", "sslpassword", "keepalives", "keepalives_idle",
+               "keepalives_interval", "keepalives_count", "target_session_attrs",
+               "autosave", "load_balance_hosts"}
+# Carried in the JSON blob or the URI query but meaningless to psycopg.
+_JUNK_OPTS = {"driver", "max_connections", "description", "pool_mode", "ssl_cert",
+              "channel_binding", "service", "target_sessions", "schema"}
+
+
+def _sanitise_opts(opts: str) -> dict:
+    """`a=b&c=d` or `a=b c=d` -> {canonical key: value}. Unknown keys are dropped.
+
+    Dropping rather than raising is deliberate: a stray `driver=node-postgres` in a
+    pasted block is not a reason for the season to refuse to start, and psycopg's
+    error for it ("invalid connection option") names nothing a staff member can act on.
+    """
+    parts = re.split(r"[&;]", opts) if ("&" in opts or ";" in opts) else opts.split()
+    out: dict[str, str] = {}
+    for part in parts:
+        part = part.strip()
+        if not part or "=" not in part:
+            continue
+        k, _, v = part.partition("=")
+        k = k.strip().lower().replace("-", "_")
+        k = _OPT_ALIASES.get(k, k)
+        if k in _JUNK_OPTS:
+            continue
+        out[k] = v.strip()
+    return out
+
+
+_SSLMODES = {"disable", "allow", "prefer", "require", "verify-ca", "verify-full"}
+
+
+def _known(o: dict) -> dict:
+    """Keep only keywords psycopg understands, and give sslmode a value libpq accepts.
+
+    `_sslmode` is the same mapper the JSON branch already used: Supabase's console writes
+    ssl=true, which is not a conninfo keyword at all, and libpq rejects sslmode=true with
+    "invalid sslmode value" - a second way the same paste could kill the boot.
+    """
+    o = {k: v for k, v in o.items() if k in _KNOWN_OPTS}
+    if "ssl" in o:
+        o.setdefault("sslmode", o["ssl"])
+        o.pop("ssl")
+    if "sslmode" in o:
+        mode = _sslmode(o.pop("sslmode"))
+        # An invented value ("prefer-ssl", a typo) is worse than none: libpq aborts with
+        # "invalid sslmode value", so drop it and let the client default apply.
+        if mode in _SSLMODES:
+            o["sslmode"] = mode
+    return o
+
+
+def _split_uri(rest: str) -> tuple:
+    """(userinfo, host, port, dbname, query) from `user:pw@host:port/db?query`."""
+    auth, sep, tail = rest.partition("/")          # tail = "db?query"
+    dbname, qsep, query = tail.partition("?")
+    userinfo, at, hostport = auth.rpartition("@")
+    host, colon, port = hostport.rpartition(":")
+    if not colon or not port.isdigit():            # no port: host is the whole thing
+        host, port = hostport, ""
+    return (userinfo if at else ""), host, port, dbname, query
+
+
 def _normalise(target) -> str:
     """HUB_DB -> a string psycopg can connect with, or "" meaning "this is a file path".
 
@@ -262,7 +334,8 @@ def _normalise(target) -> str:
             obj = json.loads(s)
         except json.JSONDecodeError as exc:
             raise OperationalError("HUB_DB looks like JSON but does not parse: " + str(exc)) from exc
-        if isinstance(obj, dict) and len(obj) == 1:
+        if isinstance(obj, dict) and len(obj) == 1 and str(next(iter(obj))).strip().lower() in (
+                "hub_db", "database_url", "connection_string", "connectionstring", "url"):
             inner = next(iter(obj.values()))
             if isinstance(inner, str) and _normalise(inner):
                 return _normalise(inner)
@@ -289,30 +362,87 @@ def _normalise(target) -> str:
         if missing:
             raise OperationalError(
                 "HUB_DB JSON is missing: " + ", ".join(missing)
-                + ". Supabase's \"Connection URI\"\n"
-                "                has everything in one line and is the easier paste.")
+                + ".\n                Supabase's \"Connection URI\" has everything in one line"
+                " and is the easier paste.")
         # Supabase's JSON user is often "postgres.<project-ref>"; the pooler wants the bare role
         if "." in str(user) and not low.get("password"):
             user = str(user).split(".", 1)[0]
         return _info_to_uri(host, low.get("port"), dbname, user, low.get("password"),
                             _sslmode(low.get("sslmode") if "sslmode" in low else low.get("ssl")))
-    m = re.match(r"^(postgres|postgresql)(:/+)(.*)$", s, re.S)
+    m = re.match(r"^(postgres(?:ql)?)(:/+)(.*)$", s, re.S)
     if m:
-        # a scheme mangled by pathlib.Path(), which collapses "//" into "/"
-        return m.group(1) + "://" + m.group(3)
-    if "://" not in s and re.search(r"(^|\s)(dbname|host|user|password|port|sslmode)=", s):
-        return s                                  # psycopg accepts keyword strings natively
-    return ""
+        # A scheme mangled by pathlib.Path(), which collapses "//" into "/". Parsed and
+        # rebuilt rather than handed on: a `?database=` Supabase appends would otherwise
+        # reach psycopg verbatim and abort the boot.
+        userinfo, host, port, dbname, query = _split_uri(m.group(3))
+        from urllib.parse import quote, urlencode
+        q = _known(_sanitise_opts(query))
+        # userinfo is passed through exactly as given: whoever wrote the URI already encoded
+        # it, and re-quoting would turn "p%3Ass" into "p%253Ass" - a different password.
+        netloc = host + (":" + port if port else "")
+        auth = (userinfo + "@") if userinfo else ""
+        # The path wins over a query parameter that aliases to dbname: Supabase's console
+        # prints `?...&database=postgres` beside `.../postgres`, but a Railway URL built by
+        # hand can say `/mydb?database=postgres`, and trusting the query there opens the
+        # wrong database rather than failing.
+        if dbname:
+            q.pop("dbname", None)
+        else:
+            dbname = q.pop("dbname", "")
+        return ("postgres://" + auth + netloc + "/" + quote(dbname, safe="")
+                + (("?" + urlencode(q)) if q else ""))
+    if "://" not in s and re.search(r"(^|\s)(dbname|host|user|password|port|sslmode|database|db)=",
+                                    s):
+        # A keyword conninfo. psycopg parses this shape natively, but only with libpq's own
+        # keyword names - so alias `database`->`dbname` and drop keys it has never heard of.
+        o = _known(_sanitise_opts(s))
+        missing = [k for k in ("host", "dbname", "user") if not o.get(k)]
+        if missing:
+            raise OperationalError(
+                "HUB_DB is a keyword connection string but is missing: " + ", ".join(missing)
+                + ".\n                Supabase's \"Connection URI\" - one line, starting"
+                " postgresql:// - is the paste that cannot go wrong.")
+        parts = []
+        for k, v in o.items():
+            if any(c.isspace() for c in v):
+                if k not in ("password", "dbname", "user", "application_name", "options"):
+                    raise OperationalError(f"HUB_DB: {k} contains a space, which is not usable.")
+                v = "'" + v.replace("\\", "\\\\").replace("'", "\\'") + "'"
+            parts.append(f"{k}={v}")
+        return " ".join(parts)
 
 
 def is_pg_target(target) -> bool:
     """True when `target` names a Postgres server rather than a file.
 
-    Delegates to _normalise so that "is this Postgres" and "can I connect to it" can never
-    disagree - the whole danger of this setting was a value that looked like neither and fell
-    through to a filename.
+    Deliberately NOT `bool(_normalise(target))`: _normalise raises on a paste it cannot
+    read, and this runs in main() before anything catches - a typo would print a raw
+    traceback instead of the one-line diagnosis. Here we only decide *which kind of thing
+    this is*; connect() is where "but it is broken" becomes an error.
     """
-    return bool(_normalise(target))
+    s = str(target or "").strip()
+    if not s:
+        return False
+    if s.startswith(("postgres://", "postgresql://")) or re.match(r"^postgres(?:ql)?:/+", s):
+        return True
+    if s[0] == "{":
+        # A JSON blob only claims Postgres when it actually carries a host; a stray
+        # `{"a":1}` is not a connection string and must not be swallowed as one.
+        try:
+            obj = json.loads(s)
+        except json.JSONDecodeError:
+            return False
+        # {"HUB_DB": "postgres://.."} is a real Railway shape; {"host": "h"} is a
+        # half-pasted blob and must stay in the "it is a config, and a broken one" camp,
+        # because routing it to the file branch would silently lose the season instead.
+        if (isinstance(obj, dict) and len(obj) == 1
+                and str(next(iter(obj))).strip().lower()
+                in ("hub_db", "database_url", "connection_string", "connectionstring", "url")):
+            return is_pg_target(next(iter(obj.values())))
+        return isinstance(obj, dict) and any(
+            str(k).lower() in ("host", "hostaddr", "endpoint", "connectionstring",
+                               "connection_string", "url", "uri") for k in obj)
+    return bool(re.search(r"(^|\s)(dbname|host|user|password|port|sslmode|database|db)=", s))
 
 
 def connect(target) -> sqlite3.Connection:
@@ -717,15 +847,39 @@ class PgConnection:
         try:
             # autocommit plus a hand-run BEGIN is exactly how sqlite3 with
             # isolation_level=None behaves, which is what the service layer assumes.
-            # prepare_threshold=0 is not cosmetic: Supabase :6543 routes through PgBouncer in
-            # transaction mode, where server-side prepared statements leak between clients and
-            # die with "prepared statement already exists". Client-side binds survive pooling.
+            # prepare_threshold must be None, NOT 0. psycopg's own guard is
+            # `if self.prepare_threshold is None`, so 0 falls through to
+            # `count >= 0`, which is true for the first execution - it means "prepare
+            # everything". Under PgBouncer (Supabase :6543) prepared statements live on
+            # the server, outlive our process, and collide: "prepared statement _pg3_0
+            # already exists", on the very first query after a restart. None is the only
+            # value that disables them; client-side binds then survive pooling fine.
             self._c = psycopg.connect(conninfo, autocommit=True,
                                        row_factory=psycopg.rows.dict_row,
-                                       prepare_threshold=0,
+                                       prepare_threshold=None,
                                        application_name="hub-knowledge-season")
         except Exception as exc:
-            raise OperationalError("could not connect to Postgres: " + str(exc)) from exc
+            msg = str(exc).strip()
+            hint = ""
+            if "invalid connection option" in msg or "invalid URI query parameter" in msg:
+                mm = re.search(r'option "([^"]+)"|parameter: "?([^"\']+)', msg)
+                who = (mm.group(1) or mm.group(2)) if mm else "a parameter"
+                hint = ("\n  HUB_DB carries a parameter Postgres does not accept (" + str(who)
+                        + "). Paste Supabase's \"Connection URI\" instead - the single line that"
+                          " starts with postgresql://")
+            elif "could not translate host name" in msg or "Name or service not known" in msg \
+                    or "Temporary failure in name resolution" in msg:
+                hint = ("\n  The host in HUB_DB does not resolve. Copy it from Supabase: Settings"
+                        " > Database > Connection string (it ends in .pooler.supabase.com)")
+            elif "timeout" in msg.lower() or "Connection refused" in msg:
+                hint = ("\n  The host was reached but nothing answered. On Supabase turn OFF "
+                        "Settings > Database > \"IPv4 restrictions\" (Railway's egress IPs rotate,"
+                        " so an allowlist cannot work), and use the pooler port 6543.")
+            elif "password authentication failed" in msg or "no pg_hba.conf entry" in msg:
+                hint = ("\n  Wrong credentials. In Supabase: Settings > Database > Reset database"
+                        " password, then repaste the whole URI. The user must stay"
+                        " postgres.<project-ref> when the pooler is on.")
+            raise OperationalError("could not connect to Postgres: " + msg + hint) from exc
         self._coltypes: dict[str, dict[str, str]] = {}
         self._uniques: dict[str, dict[str, list[str]]] = {}
         self._tables: set[str] = set()
@@ -930,7 +1084,7 @@ class PgConnection:
         try:
             self._c = self._psycopg.connect(self._conninfo, autocommit=True,
                                             row_factory=self._psycopg.rows.dict_row,
-                                            prepare_threshold=0,
+                                            prepare_threshold=None,
                                             application_name="hub-knowledge-season")
             return True
         except self._psycopg.Error:

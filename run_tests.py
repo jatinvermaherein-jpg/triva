@@ -21,6 +21,7 @@ SUITES = [
     ("scheduler + outage recovery", "tests/test_bot_scheduler.py"),
     ("backend parity (sqlite vs postgres)", "tests/test_pg_parity.py"),
     ("cross-module references", "tests/test_symbols.py"),
+    ("deploy: HUB_DB pastes + boot paths", "tests/test_deploy.py"),
 ]
 
 

@@ -1,5 +1,33 @@
 # Build status — v4.0 refactor
 
+## 2026-09-09 — first live Railway deploy: two crash-loops, both fixed
+
+The Supabase deploy at `c0f246d` never reached a player. Two independent causes, and **no data
+was ever at risk** — both fired before the first write.
+
+1. `psycopg.ProgrammingError: invalid connection option "database"`, every 0.7 s. `_normalise()`
+   handed psycopg keyword text and URI query strings through unvalidated, and Supabase's own
+   console prints the key as `database` where libpq requires `dbname`. Fixed: `db.py` is now a
+   translator, not a passthrough — aliases (`database`/`db`→`dbname`, `ssl`→`sslmode`), a key
+   whitelist, and the URI rebuilt from parsed parts. Values that are *still* unreadable exit with
+   one line naming the missing field instead of a traceback, and are never treated as a filename.
+2. `NameError: name '_SetupAskView' is not defined` in `setup_hook`. The class lived inside
+   `build_tree()`, which runs after login, but the persistent-view registration ran before it —
+   so it only ever fired against the real Discord gateway. Fixed by moving it to module scope.
+3. Latent, and the nastier of the three: **`prepare_threshold=0` does not disable prepared
+   statements.** psycopg's guard is `is None`, so `0` falls through to `count >= 0` and prepares
+   *every* query. Through PgBouncer those statements outlive the container, so the restart caused
+   by (1) or (2) then failed the first query with `prepared statement "_pg3_0" already exists`.
+   Both connect sites now pass `None`, and the README paragraph that confidently recommended `0`
+   has been rewritten to say why only `None` works.
+
+`tests/test_deploy.py` (40 checks) is new and covers exactly these: every pasteable `HUB_DB`
+shape, the `prepare_threshold` value seen by psycopg, and `setup_hook` run against a stand-in.
+The Postgres-only checks skip *loudly* when no server is configured. Verified against a real
+Supabase pooler endpoint: the old paste now fails on credentials (`tenant/user not found`), which
+is the correct complaint for fake credentials — it no longer fails on parsing.
+
+
 Last run: `python3 run_tests.py` → **all 5 suites green, 287 checks**
 (engine 48 · services 123 · UI 52 · scheduler 64 · symbol cross-check).
 

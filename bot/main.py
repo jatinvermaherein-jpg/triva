@@ -34,6 +34,22 @@ log = logging.getLogger("hub")
 TICK_SECONDS = 20
 
 
+class _SetupAskView(discord.ui.View):
+    """Ephemeral picker. `role` is required so `guild` is injected into the
+    callback - a RoleSelect with no guild cannot list the server's roles.
+
+    Module scope on purpose: HubBot.setup_hook() adds it as a persistent view so a
+    half-finished /setup survives a restart, and that runs before build_tree() ever
+    executes. Defined inside build_tree() it was a module-level NameError - and it
+    only surfaced on a real login, which is why no fake-backed suite saw it.
+    """
+
+    def __init__(self, conn):
+        super().__init__(timeout=None)
+        self.conn = conn
+        self.add_item(ui.StaffRoleSelect(conn))
+
+
 class HubBot(commands.Bot):
     def __init__(self, conn):
         intents = discord.Intents.default()
@@ -395,15 +411,6 @@ def build_tree(bot: HubBot) -> None:
     # ------------------------------------------------------------------ #
     # /setup - the one command. Ask a question, create the whole server.
     # ------------------------------------------------------------------ #
-    class _SetupAskView(discord.ui.View):
-        """Ephemeral picker. `role` is required so `guild` is injected into the
-        callback - a RoleSelect with no guild cannot list the server's roles."""
-
-        def __init__(self, conn):
-            super().__init__(timeout=None)
-            self.conn = conn
-            self.add_item(ui.StaffRoleSelect(conn))
-
     @bot.tree.command(description="Create every channel and role The Hub needs")
     # Literal, not Choice: discord.py has no supported annotation for an optional
     # `app_commands.Choice[str]` parameter (it raises "unsupported type annotation
@@ -733,8 +740,24 @@ def main() -> int:
     token = os.environ.get("HUB_TOKEN", "").strip()
     # sqlite takes a Path; a postgres URL must stay a str, because pathlib collapses
     # "postgres://" to "postgres:/" and the URL would then be treated as a filename.
-    target = (args.db if D.is_pg_target(args.db) else pathlib.Path(args.db))
-    conn = D.connect(target)
+    try:
+        target = (args.db if D.is_pg_target(args.db) else pathlib.Path(args.db))
+    except (OSError, ValueError) as exc:
+        # A 600-char JSON blob that carries no host reaches here, and pathlib answers
+        # "File name too long" - an OSError that looks like a disk problem, not a config one.
+        print(f"\n\u2717 HUB_DB is not a usable database target: {exc}\n"
+              "  Paste Supabase's \"Connection URI\" (one line, starts postgresql://), or set\n"
+              "  HUB_DB=/data/hub.db to use a SQLite file on a Volume.\n", file=sys.stderr)
+        return 78
+    try:
+        conn = D.connect(target)
+    except D.OperationalError as exc:
+        # Railway restarts a non-zero exit forever, so the first log lines are the only
+        # thing a staff member reads at 2am. Print the diagnosis, not a 40-line traceback.
+        lines = [ln.strip() for ln in str(exc).splitlines() if ln.strip()]
+        print("\n\u2717 The bot could not open its database, so it will not start.\n"
+              + "\n".join("  " + ln for ln in lines) + "\n", file=sys.stderr)
+        return 78                                     # EX_CONFIG: a variable is wrong, not the code
     bot = HubBot(conn)
     build_tree(bot)
     if args.check:
