@@ -1,6 +1,63 @@
 # Build status — v4.0 refactor
 
-## 2026-09-09 (newest) — first real click on the staff picker, and it was inert
+## 2026-09-09 (newest) — the picker answered too late, and never disabled itself
+
+```
+09:30:36  registered 11 persistent views; 0 evenings pending
+09:30:38  logged in as 🏆 Mech Arena | Tournament Hub#4457 (1541282042128367626)
+09:31:08  ERROR hub: setup role picker failed
+          File "/app/bot/ui.py", line 206, in callback
+            await interaction.response.edit_message(
+          discord.errors.NotFound: 404 Not Found (error code: 10062): Unknown interaction
+```
+
+Two separate bugs, both in `StaffRoleSelect.callback`, and the first one is a rule this README
+already had — written down, then exempted away.
+
+**1. It answered after 16 database round trips, so Discord had already dropped the token.**
+`/setup` defers before it touches the database; the picker did not, on the reasoning that
+"buttons and selects are already answers". The click is; the callback is not. Measured by wrapping
+the connection and driving the real callback: **16 statements run before the first response**
+(the `staff_role_id` write plus the 15 config reads `setup_plan_embed` makes through
+`provision_plan` — 5 roles, 9 channels, 1 category). 1.4 ms on local SQLite, which is why no
+offline suite could see it; 16 × RTT against Supabase, so any link slower than ~190 ms a round
+trip is past Discord's 3-second window, and after that the token does not arrive late — it is
+gone, and every way of answering 404s with 10062.
+
+Fixed by acknowledging first (`interaction.response.defer()`, which on a component is
+`DEFERRED_UPDATE_MESSAGE`: no visible change, full 15 minutes) and answering through `ui.reply`
+with the new `clear_content=True` — an omitted `content` leaves the message text alone, an
+explicit null replaces the picker's prompt with the plan. A refusal still answers *without*
+deferring, because a deferred update can only be completed by editing the clicked message, and
+"that control is not yours" must not overwrite the picker.
+
+**2. The picker was never disabled, because `interaction.view` does not exist.**
+`_view_state_after_pick` did `getattr(interaction, "view", None)` — and discord.py 2.7.1 has no
+such attribute (`hasattr(discord.Interaction, "view")` is `False`; the view lives on the *item*:
+`View.add_item` sets `item._view`, and the dispatcher calls
+`item.view._dispatch_item(item, interaction)`). So it was `None` on every real click and `stop()`
+never ran. The check that was supposed to catch it — "the picker that was answered is stopped" —
+passed because the test's fake interaction *invented* the attribute. `_stop_the_picker` now reads
+`self.view`, and the test drives a real `discord.ui.View` (built inside the loop, because
+`View.stop()` can only mark `is_finished()` when the view was handed a loop for its stopped
+future).
+
+Verified: 125 UI checks (was 118), all 7 suites green. Negative control on the deployed callback
+shape against a 20 ms window with 10 ms per statement: `NotFound`, view still `is_finished() ==
+False`; the fixed callback against the same link: no exception, one ack, one answer, view
+finished.
+
+**Left open, measured:** the same instrumentation says the grading button is the next to blow this
+window and by much more — `QuestionGradeView.mark` runs `V.grade_question` before it answers, and
+that is 13 statements for one answer, 34 for ten, 127 for fifty, **477 for 200** (~95 s at 200 ms
+RTT). Not fixed in this pass on purpose: the grade result is an ephemeral message to the staff
+member, so it needs `defer(thinking=True, ephemeral=True)` rather than a deferred update, the card
+re-edit has to move off the interaction onto `i.message`, and 477 blocking statements will also
+miss gateway heartbeats — so the real fix moves that work off the event loop, not merely behind a
+defer. A player's answer tap is fine: `submit_answer` is 2 statements.
+
+
+## 2026-09-09 (previous) — first real click on the staff picker, and it was inert
 
 `AttributeError: 'StaffRoleSelect' object has no attribute '_authorized'`, twice, prefixed
 `Ignoring exception in view <_SetupAskView timeout=900.0 children=1>`. A `RoleSelect` is a

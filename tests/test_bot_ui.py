@@ -10,6 +10,7 @@ import datetime as dt
 import pathlib
 import sqlite3
 import sys
+import time
 
 ROOT = pathlib.Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT / "bot"))
@@ -628,64 +629,193 @@ class _Msg:
     def __init__(self, author): self.author = author
 
 
-class _Pick(FakeInteraction):
-    """Adds what a RoleSelect interaction has and the old fake did not: values, message
-    author (the person who ran /setup), and the live view that must be stopped."""
+class _PickResp(Resp):
+    """Resp plus what a *component* interaction needs, and a model of the 3-second rule.
 
-    def __init__(self, user_id, values, owner_id, view):
+    Two facts about the real thing that the old fake could not express:
+      * answering a DEFERRED component means editing the ORIGINAL message; calling
+        response.edit_message on one is InteractionResponded, so this fake raises instead
+        of accepting a shape production rejects;
+      * an acknowledgement that misses Discord's window does not arrive late - the token is
+        gone, and the reply raises the `404 (10062) Unknown interaction` the deploy logged.
+    """
+
+    def __init__(self, pick):
+        super().__init__()
+        self.deferred = []
+        self.pick = pick
+
+    def is_done(self):            # a deferred reply counts as done - that is ui.reply's fork
+        return bool(self.deferred) or super().is_done()
+
+    def _expired(self):
+        return (self.pick.window is not None
+                and (time.monotonic() - self.pick.born) > self.pick.window)
+
+    async def defer(self, **kw):
+        if self._expired():
+            raise _not_found()
+        self.deferred.append(kw)
+        self.pick.note("ack")
+
+    async def edit_message(self, **kw):
+        """The path the deployed callback took. Every way of reaching it is fatal.
+
+        Already deferred  -> InteractionResponded in real discord.py.
+        Window missed     -> the `404 (10062) Unknown interaction` the deploy logged.
+        Neither           -> still wrong: after a deferred update the answer is an edit of
+        the ORIGINAL response, which is what ui.reply does.
+        """
+        if self.deferred:
+            raise AssertionError("a deferred component interaction is answered by "
+                                 "edit_original_response, not response.edit_message")
+        if self._expired():
+            raise _not_found()
+        raise AssertionError("response.edit_message is not how a deferred component "
+                             "interaction is answered - ui.reply edits the original")
+
+
+def _not_found():
+    """A genuine discord.NotFound, built without aiohttp's response plumbing.
+
+    The CLASS must be real: ui.reply catches `discord.NotFound` by type, so a lookalike
+    would sail past the branch that is supposed to swallow it.
+    """
+    e = discord.NotFound.__new__(discord.NotFound)
+    e.status, e.code, e.message = 404, 10062, "Unknown interaction"
+    e.text = '{"code": 10062, "message": "Unknown interaction"}'
+    e.response = None
+    return e
+
+
+class _Pick(FakeInteraction):
+    """A RoleSelect interaction. Deliberately has NO `.view` attribute.
+
+    That attribute does not exist on discord.Interaction (2.7.1: `hasattr` is False, and
+    the dispatcher reaches the view through `item.view`), and inventing it here is what let
+    `_view_state_after_pick` read a live view out of the interaction and silently get None
+    on every real click. The live view is a real discord.ui.View in _click_pick below.
+
+    `window` is the acknowledgement budget in seconds; None means "no clock".
+    """
+
+    def __init__(self, user_id, values, owner_id, window=None, log=None):
         super().__init__(user_id=user_id, staff=False)
         self.values = values
         self.message = _Msg(_Author(owner_id))
-        self.view = view
+        self.window, self.born, self._log = window, time.monotonic(), log
+        self.response = _PickResp(self)
+        self.edits, self.raised = [], None
         # setup_plan_embed reads guild.roles / guild.channels; a select always arrives
         # with a guild, and @guild_only() now guarantees it for the command too.
         self.guild = type("G", (), {"id": 1, "roles": [_role], "channels": [],
                                     "name": "The Hub"})()
 
+    def note(self, what):
+        if self._log is not None:
+            self._log.append(("ack", what))
+
+    async def edit_original_response(self, **kw):
+        # Acknowledged interactions keep their token for 15 minutes, so only an
+        # unacknowledged edit is exposed to the window.
+        if not self.response.deferred and self.response._expired():
+            raise _not_found()
+        self.edits.append(kw)
+
+
+class _SlowCfg:
+    """Connection proxy: counts statements, and can put a WAN-shaped delay on each.
+
+    sqlite3.Connection refuses attribute assignment, so it has to be wrapped. This is what
+    makes the ack-ordering claim measurable: on the live deploy every statement between the
+    click and the answer is a Supabase round trip, and there are 16 of them.
+    """
+
+    def __init__(self, inner, delay=0.0, log=None):
+        self._inner, self._delay, self._log = inner, delay, log
+        self.statements = 0
+
+    def execute(self, sql, params=None):
+        self.statements += 1
+        if self._log is not None:
+            self._log.append(("sql", sql.split()[0].upper()))
+        if self._delay:
+            time.sleep(self._delay)     # blocking, exactly as a sync psycopg call is
+        return self._inner.execute(sql, params)
+
+    def __getattr__(self, name):
+        return getattr(self._inner, name)
+
 
 _role = type("R", (), {"id": 777, "name": "Quiz Team"})()
 _conn = D.connect(_fresh(ROOT / ".pytest_tmp" / "pick.db"))
-_sel = ui.StaffRoleSelect(_conn)
 
 
-class _V:
-    stopped = False
-    def stop(self): type(self).stopped = True
+def _click_pick(conn, user_id, owner_id, values, window=None, log=None):
+    """One real picker click, in the shape the dispatcher actually uses.
 
-
-def _arm(item, values):
-    """Do what View._scheduled_task does before the callback: resolve the selection.
-
-    `item.values` reads a private field that discord.py fills from the interaction
-    payload, so calling callback() directly leaves it empty. Filling it here means the
-    test drives the real code path rather than a stubbed-out one.
+    The item must belong to a View, because `View.add_item` is what sets `item._view` -
+    the thing `_stop_the_picker` reads. The view is built INSIDE the loop because
+    View.stop() can only mark is_finished() when the view was handed a loop to make its
+    stopped-future on; built outside one, a stopped view still reports False.
     """
-    item._values = values
+    async def go():
+        sel = ui.StaffRoleSelect(conn)
+        holder = discord.ui.View(timeout=None)
+        holder.add_item(sel)
+        # what View._scheduled_task does first: fill the selection from the payload, so
+        # `item.values` reads a real value instead of an empty list.
+        sel._values = values
+        i = _Pick(user_id, values, owner_id, window=window, log=log)
+        try:
+            await sel.callback(i)
+        except discord.HTTPException as exc:
+            i.raised = exc
+        return i, holder
+    return asyncio.run(go())
 
 
-async def _click(fi):
-    _arm(_sel, fi.values)
-    return await _sel.callback(fi)
-
-
-v = _V()
-owner = _Pick(1, [_role], 1, v)
-asyncio.run(_click(owner))
-check("the owner's pick is accepted", len(owner.response.edited) == 1
-      if hasattr(owner.response, "edited") else bool(owner.response.edited), str(owner.response.edited))
+_seq: list = []
+check("the fake no longer invents an attribute discord.Interaction does not have",
+      not hasattr(discord.Interaction, "view") and not hasattr(_Pick(1, [_role], 1), "view"))
+owner, owner_view = _click_pick(_SlowCfg(_conn, log=_seq), 1, 1, [_role], log=_seq)
+check("the owner's pick is accepted", len(owner.edits) == 1, str(owner.edits))
 check("picking a role stores it BY ID", D.cfg(_conn, "staff_role_id") == 777,
       str(D.cfg(_conn, "staff_role_id")))
-check("the confirm button carries the picked role", owner.response.edited and
-      isinstance(owner.response.edited[0].get("view"), ui.SetupProvisionView)
-      and owner.response.edited[0]["view"].staff_role_id == 777,
-      str(owner.response.edited))
-check("the picker that was answered is stopped, not left tappable", v.stopped is True)
+check("the confirm button carries the picked role", owner.edits and
+      isinstance(owner.edits[0].get("view"), ui.SetupProvisionView)
+      and owner.edits[0]["view"].staff_role_id == 777, str(owner.edits))
+check("the plan replaces the picker's prompt text (explicit null, not an omission)",
+      owner.edits and "content" in owner.edits[0] and owner.edits[0]["content"] is None
+      and owner.edits[0].get("embed") is not None, str(owner.edits))
+check("the picker that was answered is stopped, not left tappable",
+      owner_view.is_finished() is True)
+check("the interaction is acknowledged BEFORE any plan read",
+      _seq and _seq[0] == ("ack", "ack") and _seq[1] == ("sql", "INSERT"), str(_seq[:3]))
+check("the work that defer() is protecting really is 16 statements",
+      sum(1 for k, _ in _seq if k == "sql") == 16,
+      str(sum(1 for k, _ in _seq if k == "sql")))
 
-stranger = _Pick(2, [_role], 1, _V())
-asyncio.run(_click(stranger))
+# The regression this section exists for. The live deploy answered after 16 round trips and
+# got `404 (10062) Unknown interaction`, logged as `setup role picker failed`. Same
+# arithmetic here at 1/1000 scale: a 20 ms window, 10 ms per statement, 16 statements.
+# Without the defer the first acknowledgement lands at ~160 ms and 404s; with it the ack is
+# the first thing the callback does and the answer still gets through.
+slow, slow_view = _click_pick(_SlowCfg(D.connect(":memory:"), delay=0.01), 1, 1, [_role],
+                              window=0.02)
+check("a link slower than the window still delivers the plan (ack first, work second)",
+      slow.raised is None and len(slow.edits) == 1,
+      f"raised={slow.raised!r} edits={slow.edits} acks={slow.response.deferred}")
+
+stranger, stranger_view = _click_pick(_conn, 2, 1, [_role])
 check("nobody else can answer someone else's /setup",
-      not stranger.response.edited and bool(stranger.response.sent),
-      f"edited={stranger.response.edited} sent={stranger.response.sent}")
+      not stranger.edits and bool(stranger.response.sent),
+      f"edits={stranger.edits} sent={stranger.response.sent}")
+check("a refusal is a message, never a deferred edit that would overwrite the picker",
+      stranger.response.deferred == [] and stranger.edits == [],
+      str(stranger.response.deferred))
+check("…and a refused picker is left tappable for the person who owns it",
+      stranger_view.is_finished() is False)
 
 # --- 11. the renamed-role bug the old gate had ----------------------------- #
 # HubView._authorized called is_staff(user) with no id, so it fell back to matching the

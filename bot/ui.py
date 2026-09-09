@@ -19,11 +19,17 @@ verified offline. Six fixed slots, of which you normally use 2-6, is boring and 
 from __future__ import annotations
 
 import datetime as dt
+import logging
 
 import discord
 
 import services as V
 from loader import load_db
+
+# Same logger main.py writes to, so an operator watching one stream sees the whole story.
+# ui.py needs it for exactly one thing: telling the log when an answer was DROPPED, which
+# is otherwise invisible (Discord shows "this interaction failed" and nothing else does).
+log = logging.getLogger("hub")
 
 MAX_OPTIONS = 4          # A-D on ONE row. 5 is the hard per-row cap and the clear
                          # button takes a slot; discord.py will not warn you - the
@@ -194,6 +200,21 @@ class StaffRoleSelect(discord.ui.RoleSelect):
             await interaction.response.send_message(
                 "Only the person who ran `/setup` can pick the staff role.", ephemeral=True)
             return
+        # ACKNOWLEDGE FIRST, WORK SECOND - the same rule /setup follows, and the one this
+        # callback broke. Measured on a real click: 16 statements run before the answer
+        # (the 1 write below + the 15 config reads setup_plan_embed makes through
+        # provision_plan), and every one is a Supabase round trip. At 1.4 ms total on local
+        # SQLite that is free; on a WAN link it is 16 x RTT, so any link slower than
+        # ~190 ms per round trip - Railway and Supabase in different regions, say - walks
+        # past Discord's 3-second acknowledgement window. Past that the token is not merely
+        # late, it is GONE: every way of answering then raises `404 Not Found (error code:
+        # 10062): Unknown interaction`, which is what the deploy log showed as `setup role
+        # picker failed`. "A select is already an answer" is true of the click, not of a
+        # callback that queries a database before replying.
+        # defer() on a component sends DEFERRED_UPDATE_MESSAGE - it acknowledges with no
+        # visible change and buys the full 15 minutes - so the answer that follows must
+        # EDIT this message (ui.reply does) rather than send a new one.
+        await interaction.response.defer()
         role = self.values[0]
         # The confirm button is staff-only, and until provision() runs nothing is stored -
         # so record the pick now. provision() re-writes the same key from the same value;
@@ -202,18 +223,32 @@ class StaffRoleSelect(discord.ui.RoleSelect):
             V.dbmod.set_cfg(self.conn, "staff_role_id", int(role.id))
         except Exception:
             pass                       # a failed convenience write must not eat the click
-        self._view_state_after_pick(interaction)
-        await interaction.response.edit_message(
-            content=None, embed=setup_plan_embed(interaction, self.conn, role.id),
-            view=SetupProvisionView(self.conn, role.id))
+        self._stop_the_picker()
+        # Never a bare edit_message(): ui.reply picks the method that is still legal for
+        # this interaction and cannot raise on a dead token. clear_content because the
+        # picker's prompt text is superseded by the plan below it.
+        if await reply(interaction, embed=setup_plan_embed(interaction, self.conn, role.id),
+                       view=SetupProvisionView(self.conn, role.id),
+                       clear_content=True) == "dropped":
+            log.warning("setup picker answered too late - the interaction had already "
+                        "expired; the role id WAS stored, so /setup mode:PLAN still works")
 
-    def _view_state_after_pick(self, interaction):
+    def _stop_the_picker(self) -> None:
         """Disable the picker we just consumed, so the message cannot be re-used.
 
-        Two views can hold this same class (the one from /setup and the copy install()
-        registered at boot), and only the interaction carries the live one.
+        `self.view`, NOT `interaction.view`. discord.py puts the live view on the Item
+        (`View.add_item` sets `item._view`; the dispatcher runs
+        `item.view._dispatch_item(item, interaction)`), and `discord.Interaction` has no
+        `view` attribute at all - so the previous `getattr(interaction, "view", None)` was
+        None on every real click, and the picker stayed tappable after being answered.
+        Two views can hold this class (the one /setup built and the copy install()
+        registered at boot); `self.view` is the one that was actually clicked.
+
+        Safe to call from inside the callback: View.stop() resolves the view's stopped
+        future, cancels its timeout task and drops it from the view store - it does not
+        cancel the task this callback is running in.
         """
-        v = getattr(interaction, "view", None)
+        v = self.view
         if v is not None:
             v.stop()
 
@@ -1345,7 +1380,8 @@ def board_embed(conn, scope: str = "season", league: str | None = None) -> disco
 # --------------------------------------------------------------------------- #
 # Answering an interaction without ever raising
 # --------------------------------------------------------------------------- #
-async def reply(i, *, content=None, embed=None, view=None, file=None, ephemeral=True):
+async def reply(i, *, content=None, embed=None, view=None, file=None, ephemeral=True,
+                clear_content=False):
     """Answer `i` however it currently can be answered, and never propagate a 404.
 
     One function instead of 72 hand-written `i.response.send_message(...)` sites, because
@@ -1355,9 +1391,16 @@ async def reply(i, *, content=None, embed=None, view=None, file=None, ephemeral=
     to explain the problem. The branch order mirrors discord.py's own state machine
     (`is_done()` is False until something is sent, and a deferred reply counts as done).
     Returns "replied" or "dropped"; callers never have to handle either.
+
+    clear_content is the one field the None-filter above cannot express. Omitting `content`
+    leaves the message's text alone; sending an explicit null deletes it. A deferred
+    component interaction (DEFERRED_UPDATE_MESSAGE) edits the message it was clicked on,
+    so a caller that is replacing that message's text needs the explicit null.
     """
     kw = {k: v for k, v in (("content", content), ("embed", embed),
                             ("view", view), ("file", file)) if v is not None}
+    if clear_content:
+        kw["content"] = None
     if not kw:
         # edit_original_response() with no fields is a Discord 500, not a no-op. A caller
         # with nothing to say is a bug in the caller, so keep it loud but legal.
