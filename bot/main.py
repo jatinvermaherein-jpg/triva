@@ -60,7 +60,12 @@ class HubBot(commands.Bot):
     def __init__(self, conn):
         intents = discord.Intents.default()
         intents.members = True          # role assignment + cached members
-        super().__init__(command_prefix="!", intents=intents,
+        # This bot exposes application commands and components only.  Using the
+        # exact ``when_mentioned`` sentinel keeps discord.py from warning that a
+        # message-content intent is missing; we deliberately do not need that
+        # privileged gateway intent for buttons, selects or modals.
+        super().__init__(command_prefix=commands.when_mentioned, intents=intents,
+                         help_command=None,
                          allowed_mentions=discord.AllowedMentions.none())
         self.conn = conn
         self.hub_channel_id: int | None = None
@@ -82,6 +87,7 @@ class HubBot(commands.Bot):
         # /setup names this "hub" (announcements); /setup-channel calls it
         # hub_channel_id. Both are honoured; whichever was configured last wins.
         self.hub_channel_id = (D.cfg(self.conn, "hub_channel_id")
+                               or D.cfg(self.conn, V._hubkey("channel", "hub"))
                                or D.cfg(self.conn, "hub:hub"))
         self.loop.create_task(self.clock())
         await self.backfill()
@@ -820,14 +826,17 @@ Discord portal checklist (no privileges needed, but you must own the server invi
        /setup  mode:SETUP    pick the ONE staff role; the bot creates the
                              category, 9 channels and 5 champion roles, and
                              stores every Discord id in its own database
-       /setup-panel          the hub card, into #staff-only
-       /pin-board            the permanent leaderboard, into #league-table
-       /pin-checkout         the pending-checkout queue staff clear by hand
-       /season-create        (blank start day = next Monday)
-     /setup-channel still exists to point a league at a different channel than the
-     one /setup made - it overrides, it is not a required step.
-     Everything after this is buttons and modals. You never type an evening id, a
-     player id or a channel id - the pickers carry them.
+       setup automatically posts the complete staff control panel and guide in #staff-only.
+       Use those buttons for season creation, channel wiring, previews, authoring,
+       opening/ticking, hub/leaderboard/checkout posts, payouts, exports and season end.
+       The old slash commands remain only as backwards-compatible fallbacks; normal
+       staff work is button-first and never asks you to type an evening, player or
+       channel id. The panel stays within Discord's 25-item / 5-buttons-per-row limits.
+
+     Re-running setup is safe: it adopts stored ids, repairs managed role colours,
+     recreates deleted objects and refreshes the staff panel/guide instead of spamming
+     duplicates. /setup mode:STATUS is still available as a bootstrap diagnostic; the
+     panel has a Wiring status button too.
 
   Renaming afterwards is FREE. The bot follows ids, not names: rename #trivia-night
   to #quiz-night, recolour "Strategy Champion", move channels between categories,

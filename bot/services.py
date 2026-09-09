@@ -187,6 +187,24 @@ async def provision(conn, ws, staff_role_id: int | None = None,
         made.append({"kind": kind, "key": key, "name": name, "id": int(obj.id),
                      "created": created, "adopted": adopted})
 
+    async def sync_role_appearance(obj, colour: int, hoist: bool) -> None:
+        """Repair colours on roles adopted from an older/hand-built setup.
+
+        Creating a role already applies the colour, but adopting an existing role
+        used to leave it whatever colour it happened to have.  The appearance sync
+        is best-effort: a picked role above the bot's highest role must not make the
+        whole idempotent setup fail.  ``edit_role`` is optional on the service seam
+        so the Discord-free tests and alternative workspaces remain compatible.
+        """
+        edit = getattr(ws, "edit_role", None)
+        if edit is None:
+            return
+        try:
+            await edit(obj, colour=colour, hoist=hoist,
+                       reason="Hub Knowledge Season role colours")
+        except Exception:  # noqa: BLE001 - appearance must never block setup
+            pass
+
     # ---- roles ---------------------------------------------------------- #
     for key, name, colour, hoist in PROVISION_ROLES:
         if key == "staff" and staff_role_id is not None:
@@ -196,6 +214,7 @@ async def provision(conn, ws, staff_role_id: int | None = None,
             picked = ws.get_role(int(staff_role_id)) or ws.find_role(name)
             if picked is None:
                 raise ValueError(f"role {staff_role_id} does not exist in this server")
+            await sync_role_appearance(picked, colour, hoist)
             note("role", key, picked.name, picked, False, "selected")
             continue
         obj, adopted = _adopt(ws, conn, "role", key, name, ws.get_role,
@@ -205,6 +224,7 @@ async def provision(conn, ws, staff_role_id: int | None = None,
                                        reason="Hub Knowledge Season /setup")
             note("role", key, name, obj, True, None)
         else:
+            await sync_role_appearance(obj, colour, hoist)
             note("role", key, name, obj, False, adopted)
 
     # look it up by its namespaced key: ids is keyed by the FULL config key now, and
@@ -272,8 +292,9 @@ def _writes(staff_id: int, *, everyone_read: bool) -> dict:
 
     Public league/result channels: @everyone can read and type; staff can do both too
     (nothing extra, no per-league grants). Private channels: @everyone cannot even see
-    them, and the selected staff role is the only thing that can. That is the whole
-    permission surface - a channel is either "the server can see it" or "staff only".
+    them, and the selected staff role is the only human role that can. The bot itself
+    is added by :func:`ui._to_overwrites` as a narrowly-scoped exception so it can post
+    the staff panel it was asked to create. No management permission is granted there.
     """
     return {"everyone": {"read": everyone_read, "write": everyone_read},
             "staff": {"read": True, "write": True},
