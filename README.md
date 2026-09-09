@@ -244,10 +244,38 @@ run_tests.py`). What had to be handled, each found by running it:
 award totals, leaderboard order, audit size and payout total are **identical**, then closes the
 socket to prove the reconnect works.
 
+### The build entry point (why there is a `main.py` in the repo root)
+
+Railway's builder is now **Railpack** (`using build driver railpack-v0.39.0` in the build log).
+Unlike Nixpacks it does not take its start command from `railway.json` — it detects a framework,
+and for a plain script it looks for `main.py` or `app.py` **in the project root**, failing the
+build outright if there is none. So the repo carries a ~17-line root `main.py` that `runpy`-executes
+`bot/main.py`. It is deliberately a shim: `bot/` is not a package, and running the file keeps
+`__name__ == "__main__"`, so argument parsing, `--check`, `HUB_DB` resolution and exit codes all
+still live in exactly one place. `tests/test_deploy.py` asserts the root file stays a shim (no
+`argparse`, no `discord`) and that `.dockerignore` never excludes it.
+
+Measured against the real `railpack-v0.39.0` binary, on this repo:
+
+```
+before (no root main.py)  → exit 1, "✖ No start command detected"
+after                     → exit 0, deploy startCommand: python main.py
+python version            → 3.13.15, resolved from .python-version
+                            ("idiomatic-version-file"), so runtime.txt still governs
+.dockerignore             → honoured; tests/, sim/, tools/, *.db stay out of the image
+```
+
+If you would rather pin the command explicitly than rely on autodetection, either set
+**Settings → Deploy → Start Command** to `python main.py` in the Railway dashboard, or add a
+`railpack.json` at the repo root (`{"deploy": {"startCommand": "python main.py"}}`) — Railpack
+reads that file and ignores `railway.json` for this purpose. `railway.json` still carries
+`numReplicas: 1` and the restart policy, which do still apply.
+
 ### If the build fails
 
 | log line | cause | fix |
-|---|---|---|
+| `✖ No start command detected` + `railpack prepare exited with an error` | Railway now builds with **Railpack 0.39**, not Nixpacks. Railpack does **not** read `railway.json`'s `deploy.startCommand`; it autodetects, and there was no `main.py`/`app.py` in the repo root | fixed by the root `main.py` shim (below). Verify with `railpack prepare . --error-missing-start`, or pin Settings → Deploy → Start Command in the dashboard |
+| `Failed to ensure mise is installed` | Railpack provisions Python through `mise`, which wants a writable cache dir | nothing to do in the repo; it runs as root in the builder. Locally set `RAILPACK_CACHE_DIR` |
 | `invalid type: map, expected a sequence for key 'providers'` | an old `nixpacks.toml` from before this fix, still in your working copy | delete `nixpacks.toml`; it is not needed |
 | `Python version 3.13 is not supported` / it installs an old Python anyway | this deploy's Nixpacks (1.41) resolves versions from its Nixpkgs snapshot, which I cannot query from here | change `runtime.txt` and `.python-version` to `3.12` — one line, then redeploy. Or set `NIXPACKS_PYTHON_VERSION` and delete both files |
 | `ModuleNotFoundError: No module named 'discord'` | requirements not picked up | check the service root is the **repo root**, not `bot/` |

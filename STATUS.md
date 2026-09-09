@@ -1,5 +1,17 @@
 # Build status — v4.0 refactor
 
+## 2026-09-09 (later) — the *build* broke too: Railway changed builders to Railpack
+
+The next deploy never started a container at all: `using build driver railpack-v0.39.0` …
+`✖ No start command detected` … `railpack prepare exited with an error`. Railpack does not read
+`railway.json`'s `deploy.startCommand` the way Nixpacks did — it autodetects, and for a plain
+script wants `main.py`/`app.py` in the project root. Fixed with a 17-line root `main.py` that
+`runpy`-executes `bot/main.py` (single entry point, no `bot/__init__.py` needed, `__main__`
+preserved). Verified with the actual `railpack-v0.39.0-x86_64-linux-musl` binary: exit 1 before,
+exit 0 and `startCommand: python main.py` after, Python resolved to 3.13.15 from
+`.python-version`, `.dockerignore` still honoured. `test_deploy.py` now runs `python main.py
+--check` from a bare tree and guards the shim against becoming a second copy.
+
 ## 2026-09-09 — first live Railway deploy: two crash-loops, both fixed
 
 The Supabase deploy at `c0f246d` never reached a player. Two independent causes, and **no data

@@ -10,6 +10,7 @@ Run standalone (SQLite) or under HUB_TEST_DB for the Postgres-only checks:
 """
 import os
 import pathlib
+import shutil
 import sys
 
 ROOT = pathlib.Path(__file__).resolve().parents[1]
@@ -153,6 +154,54 @@ def main() -> int:
           out.strip().splitlines()[-1][:120] if out.strip() else "(no output)")
     check("a refused connection says the database could not be opened",
           "could not open its database" in out, out[:200])
+
+    # ------------------------------------------- the root entry point the builder demands
+    # Railpack (Railway's builder since it replaced Nixpacks) fails the *build* with
+    # "No start command detected" unless it finds main.py/app.py in the project root, and
+    # it does not read the start command from railway.json. A second main.py would be the
+    # easy way out and would drift; this asserts the shim stays a shim.
+    root_main = ROOT / "main.py"
+    check("main.py exists in the project root", root_main.is_file())
+    if root_main.is_file():
+        src = root_main.read_text()
+        # Divergence risk, not decoration: a root main.py that grew its own argparse or
+        # its own discord login would silently become the real entry point, and the tests
+        # would keep exercising bot/main.py instead of what Railway runs.
+        check("the root main.py delegates rather than duplicating",
+              "bot" in src and "argparse" not in src and "discord" not in src
+              and len(src.splitlines()) < 40,
+              f"{len(src.splitlines())} lines, argparse={'argparse' in src}, "
+              f"discord={'discord' in src}")
+        ignored = [ln.strip() for ln in (ROOT / ".dockerignore").read_text().splitlines()
+                   if ln.strip() and not ln.startswith("#")]
+        import fnmatch
+        hit = [g for g in ignored if fnmatch.fnmatch("main.py", g)]
+        check("the root main.py is not excluded from the build context", not hit, str(hit))
+        # And it must actually run: exactly the command the plan says, in a bare directory.
+        import subprocess, tempfile
+        with tempfile.TemporaryDirectory() as td:
+            tdp = pathlib.Path(td)
+            for d in ("bot", "engine"):
+                shutil.copytree(ROOT / d, tdp / d)
+            shutil.copy(ROOT / "main.py", tdp / "main.py")
+            r = subprocess.run([sys.executable, "main.py", "--check"], cwd=str(tdp),
+                               capture_output=True, text=True, timeout=120,
+                               env={**os.environ, "HUB_DB": "hub.db", "HUB_TOKEN": ""})
+        out = r.stdout + r.stderr
+        check("`python main.py --check` runs from a bare tree",
+              "db " in out and "Traceback" not in out,
+              out.strip().splitlines()[-1][:120] if out.strip() else f"exit {r.returncode}, no output")
+    rp = shutil.which("railpack")
+    if rp:
+        import subprocess
+        r = subprocess.run([rp, "prepare", str(ROOT), "--error-missing-start",
+                            "--show-plan", "--hide-pretty-plan"],
+                           capture_output=True, text=True, timeout=300,
+                           env={**os.environ, "RAILPACK_CACHE_DIR": str(ROOT / ".pytest_tmp" / "rpcache")})
+        check("railpack prepare accepts the repo", r.returncode == 0,
+              r.stderr.strip().splitlines()[-1][:110] if r.stderr.strip() else "")
+    else:
+        print("      (railpack binary not installed - builder plan check skipped)")
 
     # ------------------------------------------------------------ only with a live server
     url = (sys.argv[1] if len(sys.argv) > 1 else "") or ""
