@@ -150,7 +150,8 @@ Set it up like this:
    connection: Railway has no fixed egress IP, so the direct 5432 port is unreachable for it.
 3. **Settings → Database → IPv4 — turn OFF the "enforce IP restrictions"** toggle, or every
    deploy connection is refused from an IP you cannot allowlist.
-4. Railway → Variables → `HUB_DB` = that URL, **as a Secret**. Keep it out of git: that URL alone
+4. Railway → Variables → **RAW Editor** → paste the block below, then fill in `HUB_TOKEN` and
+   `HUB_GUILD`. Keep `HUB_DB` out of git: that URL alone
    lets anyone rewrite a season.
 5. Deploy, then run `/setup` again if you are moving an existing season (see below).
 
@@ -167,6 +168,34 @@ table's row count matches the source.
 It copies rows, then re-aligns every `id` sequence, which is the step that gets forgotten and
 bites later: Postgres sequences do not follow explicitly-inserted ids, so the next `INSERT`
 without an id collides with a row that already exists — during a grading run, days from now.
+
+Paste one of these into the RAW Editor (`.env` style — the form Railway's editor expects):
+
+```
+HUB_TOKEN=
+HUB_DB=postgres://postgres.YOUR-REF:YOUR-PASSWORD@aws-0-ap-south-1.pooler.supabase.com:6543/postgres?sslmode=require
+HUB_GUILD=
+```
+
+or the JSON form, which does the same thing:
+
+```json
+{
+  "HUB_TOKEN": "",
+  "HUB_DB": "postgres://postgres.YOUR-REF:YOUR-PASSWORD@aws-0-ap-south-1.pooler.supabase.com:6543/postgres?sslmode=require",
+  "HUB_GUILD": ""
+}
+```
+
+Nothing else is needed — the start command comes from `railway.json`, the Python version from
+`runtime.txt`, and every other setting (open hour, answer window, point bands, channel/role ids)
+is written into the database by `/setup`, not read from the environment.
+
+Two things the bot now tolerates, because both are easy to paste by accident: Supabase's **JSON**
+"Database connection string" (it will be converted to a URI for you), and a `postgresql://` scheme.
+Anything that is neither a URL nor a recognisable connection object is **refused at boot** rather
+than treated as a filename — silently falling back to `/app/hub.db` is the one outcome where the
+bot looks healthy and still loses the season.
 
 **If you would rather stay on SQLite:** then yes, **add a Volume and mount it at `/data`**, and
 set `HUB_DB=/data/hub.db`. `python bot/main.py --check` prints a warning when the DB is not on a

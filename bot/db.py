@@ -209,24 +209,110 @@ def _migrate(db) -> list[str]:
     return added
 
 
-def is_pg_target(target) -> bool:
-    """True when `target` names a Postgres server rather than a file.
+# Keys people actually paste. Supabase's "Database connection string" is JSON, its "URI" is a
+# URL, and Railway's own Raw editor accepts a flat {KEY: value} object - so all three shapes
+# have to land in the same place. Otherwise an operator pastes a perfectly valid config, the bot
+# decides it is not a URL, and quietly writes to a file instead: no error, and the season vanishes
+# at the next redeploy, which is the exact failure this backend was added to remove.
+_PG_KEYS = ("host", "dbname", "database", "user", "password", "port", "ssl", "sslmode",
+            "connectionstring", "connection_string", "url", "uri", "db", "driver", "endpoint")
 
-    Tolerant of a mangled scheme on purpose. `pathlib.Path("postgres://host/db")` collapses the
-    "//" into "postgres:/host/db", and several callers hand around Path objects - if the check
-    were strict, that would not fail, it would open (or create) a *SQLite file named after the
-    URL* and the app would run happily against a database nobody is backing up. Detecting the
-    host:port shape catches that instead of silently mis-storing every award.
-    """
-    s = str(target or "").strip()
-    if s.startswith(("postgres://", "postgresql://", "postgres:/", "postgresql:/")):
-        return True
-    return bool(re.match(r"(postgres|postgresql):/+[A-Za-z0-9_.-]+:\d+/", s))
+
+def _info_to_uri(host, port, dbname, user, password, sslmode) -> str:
+    """Build a postgres:// URI. Percent-encoding is what makes Supabase passwords - which are
+    full of brackets, spaces and slashes - survivable, where keyword syntax would need quoting."""
+    from urllib.parse import quote
+    auth = ""
+    if user:
+        auth = quote(str(user), safe="")
+        if password:
+            auth += ":" + quote(str(password), safe="")
+        auth += "@"
+    tail = "" if sslmode in (None, "", "disable", "false", "0") else "?sslmode=" + sslmode
+    return "postgres://" + auth + str(host) + ":" + (str(port) or "5432") + "/" + str(dbname) + tail
+
+
+def _sslmode(raw) -> str:
+    if raw is None:
+        return "require"                      # Supabase is TLS-only; defaulting to plain is wrong
+    s = str(raw).strip().lower()
+    if s in ("", "false", "0", "disable", "disabled", "not required", "no"):
+        return "disable"
+    if s in ("true", "1", "yes", "require", "required"):
+        return "require"
+    return s                                  # verify-full etc. pass through
 
 
 def _normalise(target) -> str:
+    """HUB_DB -> a string psycopg can connect with, or "" meaning "this is a file path".
+
+    Accepted shapes, because every one of them is something a copy/paste really produces:
+      * postgres:// and postgresql:// URIs   (Supabase "Connection URI", Railway raw editor)
+      * a scheme mangled by pathlib          ("postgres:/host/db" - Path collapses the "//")
+      * Supabase's JSON blob                 ({"host":..,"port":..,"password":..,"db":..})
+      * a one-key Railway wrapper            ({"HUB_DB": "postgres://.."})
+      * psycopg keyword text                 ("dbname=postgres host=.. user=..")
+    A JSON object that is not a connection config is refused loudly rather than guessed at.
+    """
     s = str(target or "").strip()
-    return re.sub(r"^(postgres|postgresql):/+", r"\1://", s)
+    if not s:
+        return ""
+    if s[0] in "{[":
+        try:
+            obj = json.loads(s)
+        except json.JSONDecodeError as exc:
+            raise OperationalError("HUB_DB looks like JSON but does not parse: " + str(exc)) from exc
+        if isinstance(obj, dict) and len(obj) == 1:
+            inner = next(iter(obj.values()))
+            if isinstance(inner, str) and _normalise(inner):
+                return _normalise(inner)
+        if not isinstance(obj, dict):
+            raise OperationalError(
+                "HUB_DB is JSON but not an object of connection fields. Paste Supabase's\n"
+                "                \"Connection URI\" (starts with postgresql://) instead.")
+        low = {}
+        for k, v in obj.items():
+            kk = str(k).strip().lower()
+            if kk not in ("description", "max_connections", "read_replica_url", "supavisor"):
+                low[kk] = v
+        if set(low) - set(_PG_KEYS) and not ({"host", "dbname", "database", "user"} & set(low)):
+            raise OperationalError(
+                "HUB_DB JSON has no host/dbname/user, so it is not a connection string.\n"
+                "                Unrecognised keys: " + ", ".join(sorted(set(low) - set(_PG_KEYS))[:6]))
+        host = low.get("host") or low.get("endpoint") or ""
+        dbname = low.get("dbname") or low.get("database") or low.get("db") or ""
+        user = low.get("user") or ""
+        for k in ("connectionstring", "connection_string", "url", "uri"):
+            if low.get(k):
+                return _normalise(low[k])
+        missing = [n for n, v in (("host", host), ("dbname", dbname), ("user", user)) if not v]
+        if missing:
+            raise OperationalError(
+                "HUB_DB JSON is missing: " + ", ".join(missing)
+                + ". Supabase's \"Connection URI\"\n"
+                "                has everything in one line and is the easier paste.")
+        # Supabase's JSON user is often "postgres.<project-ref>"; the pooler wants the bare role
+        if "." in str(user) and not low.get("password"):
+            user = str(user).split(".", 1)[0]
+        return _info_to_uri(host, low.get("port"), dbname, user, low.get("password"),
+                            _sslmode(low.get("sslmode") if "sslmode" in low else low.get("ssl")))
+    m = re.match(r"^(postgres|postgresql)(:/+)(.*)$", s, re.S)
+    if m:
+        # a scheme mangled by pathlib.Path(), which collapses "//" into "/"
+        return m.group(1) + "://" + m.group(3)
+    if "://" not in s and re.search(r"(^|\s)(dbname|host|user|password|port|sslmode)=", s):
+        return s                                  # psycopg accepts keyword strings natively
+    return ""
+
+
+def is_pg_target(target) -> bool:
+    """True when `target` names a Postgres server rather than a file.
+
+    Delegates to _normalise so that "is this Postgres" and "can I connect to it" can never
+    disagree - the whole danger of this setting was a value that looked like neither and fell
+    through to a filename.
+    """
+    return bool(_normalise(target))
 
 
 def connect(target) -> sqlite3.Connection:
@@ -235,8 +321,9 @@ def connect(target) -> sqlite3.Connection:
     One entry point for both backends is the reason 144 call sites stayed synchronous when
     the store moved to Supabase: nothing outside this function knows which engine it is on.
     """
-    if is_pg_target(target):
-        db = PgConnection(_normalise(target))
+    conninfo = _normalise(target)
+    if conninfo:
+        db = PgConnection(conninfo)
         db.executescript(SCHEMA)
         _migrate(db)
         db.sync_sequences()
