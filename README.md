@@ -279,16 +279,42 @@ and *every* way of answering raises `404 Unknown interaction`, including from in
 handler that was supposed to explain it. That is exactly how `/setup` failed on the first live
 run: the traceback in the log was the error handler itself dying.
 
-Two rules follow, both asserted in `tests/test_deploy.py`:
+Two rules follow, asserted in `tests/test_deploy.py` and `tests/test_bot_ui.py`:
 
 1. **Acknowledge first, work second.** `/setup`, `/setup-panel` and `/clock-tick` call
    `i.response.defer(ephemeral=True)` before touching the database, so a slow round trip to
-   Supabase cannot cost the answer. Buttons and selects are exempt — they are already answers.
+   Supabase cannot cost the answer.
+   *This used to exempt buttons and selects — "they are already answers" — and that sentence
+   cost a live deploy.* The click is an answer; the callback is not. `StaffRoleSelect.callback`
+   ran **16 statements** (one `staff_role_id` write plus the 15 config reads
+   `setup_plan_embed` makes through `provision_plan`) before it replied, and on the deploy
+   every one of those is a Supabase round trip. Free on local SQLite — 1.4 ms for all 16 —
+   and 16 × RTT on a WAN link, so any link slower than ~190 ms per round trip (Railway and
+   Supabase in different regions) walks out of the window. The log said
+   `setup role picker failed … NotFound: 404 (error code: 10062): Unknown interaction`.
+   It now calls `interaction.response.defer()` — on a component that is
+   `DEFERRED_UPDATE_MESSAGE`, which acknowledges with no visible change and buys the full
+   15 minutes — and then answers through `ui.reply`. Note what that forces: a deferred
+   *update* can only be completed by **editing the message that was clicked**, so a refusal
+   must never defer (it would overwrite the picker with the refusal text).
+   `test_bot_ui.py` asserts the ack precedes the first plan read, and re-runs the whole click
+   against a connection that costs 10 ms a statement with a 20 ms window — the same
+   arithmetic, 1000× smaller.
 2. **Never let a reply raise.** All of them go through `ui.reply(i, ...)`, which picks the one
    method that is legal for the interaction's current state (`is_done()` → `edit_original_response`,
    otherwise `send_message`) and swallows only `NotFound`/4xx — anything else still propagates, so
    a genuine bug is not mistaken for a lost race. `SETUP_NOTES` says "enable Members intent":
    that one *is* required, unlike Message Content.
+
+**Still exposed, deliberately not changed here.** The same measurement run over the other
+callbacks says the grading button is the next one to blow this window, and by a wide margin:
+`QuestionGradeView.mark` runs `V.grade_question` *before* it answers, and that is 13 statements
+for a question with one answer and **477 for one with 200** — about 95 s at 200 ms RTT. Fixing it
+is not the same one-liner: the grade result is an ephemeral message to the staff member, so it
+needs `defer(thinking=True, ephemeral=True)` (not a deferred *update*), the card re-edit has to
+move from the interaction to `i.message`, and 477 blocking statements on the event loop will also
+miss gateway heartbeats — so the honest fix moves that work off the loop, not just behind a defer.
+A player tapping an answer button is safe: `submit_answer` is 2 statements.
 
 ### The staff permission check, and the bug the first real click exposed
 
@@ -331,6 +357,8 @@ Discord, and it caught a typo of mine while I was writing it.
 | `NameError: name '_SetupAskView' is not defined` inside `setup_hook` | a persistent view defined inside `build_tree()`, referenced at module scope before that function ever runs | fixed by moving the class to module scope; `test_deploy.py` now calls `setup_hook` against a stand-in, because this only ever fired on a real gateway login |
 | `FATAL: (ENOTFOUND) tenant/user postgres.<ref> not found` | project ref or pooler user wrong | the user must stay `postgres.<ref>` while Connection Pooling is on; drop the `.ref` only if you turn pooling off and use port 5432 |
 | `404 Not Found (error code: 10062): Unknown interaction` on `/setup`, with a traceback from the error handler | the reply was sent after the interaction's 3-second window, or the gateway reconnected in between (look for a second `logging in using static token` nearby in the log) | fixed: the slow commands now `defer()` first and every answer goes through `ui.reply`, which cannot raise. Just run `/setup` again — nothing was created |
+| `setup role picker failed` + `404 (error code: 10062): Unknown interaction` from `StaffRoleSelect.callback` | the picker answered after **16 database round trips** (1 `staff_role_id` write + the 15 config reads the plan makes). Free on SQLite, 16 × RTT on Supabase — past Discord's 3-second window on a cross-region link | fixed: the callback defers before it touches the database, then answers through `ui.reply`. The role id *was* stored, so `/setup mode:PLAN` still reads correctly — run `/setup mode:SETUP` to pick again |
+| the staff-role picker stays clickable after you have already picked | `_view_state_after_pick` read `interaction.view`, which does not exist on `discord.Interaction` (discord.py keeps the live view on the *item*: `View.add_item` sets `item._view`), so it was `None` on every real click and `stop()` never ran | fixed: `_stop_the_picker` stops `self.view`. The test that was supposed to catch this passed because its fake interaction invented the attribute — it now drives a real `discord.ui.View` and asserts `is_finished()` |
 | `invalid sslmode value: "true"` | Supabase's JSON field `ssl` pasted into a conninfo string | `db.py` maps it now; or paste the URI, which says `sslmode=require` |
 
 The middle row is the only build risk I could not eliminate from here: I verified the Python the suite
