@@ -71,10 +71,10 @@ class HubBot(commands.Bot):
     # ------------------------------------------------------------------ startup
     async def setup_hook(self) -> None:
         ui.install(self, self.conn)
-        # /setup's role picker lives on an ephemeral message, so it is gone after a
-        # restart; registering it keeps a half-finished setup resumable via the
-        # confirm button, which IS persistent.
-        self.add_view(_SetupAskView(self.conn))
+        # _SetupAskView is deliberately NOT registered here. A view is resumable only when
+        # it is persistent, and this one carries no message_id, so `add_view` gave a false
+        # promise: after a restart the picker is simply gone and /setup is re-run - which is
+        # what the confirm button (SetupProvisionView, persistent, id-bearing) is for.
         # Panels refresh themselves after an award. They need the client (to
         # resolve channels), and views are built long before any interaction, so
         # the bot hands itself over once - never per-click.
@@ -419,6 +419,8 @@ def build_tree(bot: HubBot) -> None:
     # /setup - the one command. Ask a question, create the whole server.
     # ------------------------------------------------------------------ #
     @bot.tree.command(description="Create every channel and role The Hub needs")
+    # Without this, a DM invocation reaches setup_plan_embed with interaction.guild None.
+    @app_commands.guild_only()
     # Literal, not Choice: discord.py has no supported annotation for an optional
     # `app_commands.Choice[str]` parameter (it raises "unsupported type annotation
     # <class Interaction>" while building the tree). Literal gives the same dropdown.
@@ -426,6 +428,9 @@ def build_tree(bot: HubBot) -> None:
     @app_commands.checks.has_permissions(manage_roles=True, manage_channels=True)
     async def setup(i: discord.Interaction,
                     mode: Literal["plan", "status", "setup"] = "plan") -> None:
+        if i.guild is None:                      # guild_only() should prevent this
+            return await i.response.send_message("Run this **in the server**, not in a DM.",
+                                                 ephemeral=True)
         conn = i.client.conn
         # Defer FIRST, before touching the database. Every branch below reads config and
         # walks the guild; a slow WAN round trip to Supabase that slips past 3s makes
@@ -475,7 +480,7 @@ def _setup_status(conn, guild) -> discord.Embed:
     bad, ok = [], []
     for key, name, staff_only, _slow, why in V.PROVISION_CHANNELS:
         cid_ = D.cfg(conn, V._hubkey("channel", key))
-        chan = guild.get_channel(cid_) if cid_ else None
+        chan = guild.get_channel(cid_) if (cid_ and guild) else None
         if chan is None:
             bad.append(f"✖️ **#{name}** — {why}"
                        + (f" (stored id `{cid_}` is dead)" if cid_ else " (never created)"))

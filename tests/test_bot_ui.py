@@ -585,4 +585,131 @@ check("and no @everyone/staff overwrite ever grants a management permission",
       str(sorted(_flags)))
 
 
+# --- 9. items vs views: who is allowed to hold which method ---------------- #
+# A live deploy proved this gap: StaffRoleSelect called self._authorized(), a HubView
+# method, and RoleSelect has no such thing. Every other call site lives inside a View, so
+# the pattern read as safe and no click test reached this one. Now the class hierarchy
+# itself is the check, plus the two behaviours it was guarding.
+import ast as _ast
+
+_ITEM_BASES = {"Button", "RoleSelect", "ChannelSelect", "UserSelect", "TextInput",
+               "StringSelect", "Modal", "Select"}
+_ui_mod = _ast.parse((ROOT / "bot" / "ui.py").read_text())
+_offenders = []
+for _n in _ast.walk(_ui_mod):
+    if not isinstance(_n, _ast.ClassDef):
+        continue
+    if not any(getattr(b, "id", getattr(b, "attr", "")) in _ITEM_BASES for b in _n.bases):
+        continue
+    # everything the class binds itself, so an in-class helper is not flagged
+    _own = {f.name for f in _n.body if isinstance(f, (_ast.FunctionDef, _ast.AsyncFunctionDef))}
+    for _s in _ast.walk(_n):
+        if isinstance(_s, _ast.Attribute) and isinstance(_s.value, _ast.Name) \
+                and _s.value.id == "self":
+            _own.add(_s.attr)
+    for _m in _ast.walk(_n):
+        # `self.<private>` on an Item must exist on the Item hierarchy. Views own
+        # _authorized/_scheduled_task; Items do not, and nothing but a real click says so.
+        if (isinstance(_m, _ast.Attribute) and _m.attr.startswith("_")
+                and not _m.attr.startswith("__") and isinstance(_m.value, _ast.Name)
+                and _m.value.id == "self" and _m.attr not in _own
+                and not hasattr(discord.ui.Item, _m.attr)):
+            _offenders.append(f"{_n.name}.{_m.attr}")
+check("no bare ui.Item reaches for a View-only private method",
+      not _offenders, "undefined on Item: " + ", ".join(sorted(set(_offenders))))
+check("ui.gate exists and is what both sides use", callable(getattr(ui, "gate", None)))
+
+# --- 10. the real picker click, end to end --------------------------------- #
+class _Author:
+    def __init__(self, uid): self.id = uid
+
+
+class _Msg:
+    def __init__(self, author): self.author = author
+
+
+class _Pick(FakeInteraction):
+    """Adds what a RoleSelect interaction has and the old fake did not: values, message
+    author (the person who ran /setup), and the live view that must be stopped."""
+
+    def __init__(self, user_id, values, owner_id, view):
+        super().__init__(user_id=user_id, staff=False)
+        self.values = values
+        self.message = _Msg(_Author(owner_id))
+        self.view = view
+        # setup_plan_embed reads guild.roles / guild.channels; a select always arrives
+        # with a guild, and @guild_only() now guarantees it for the command too.
+        self.guild = type("G", (), {"id": 1, "roles": [_role], "channels": [],
+                                    "name": "The Hub"})()
+
+
+_role = type("R", (), {"id": 777, "name": "Quiz Team"})()
+_conn = D.connect(_fresh(ROOT / ".pytest_tmp" / "pick.db"))
+_sel = ui.StaffRoleSelect(_conn)
+
+
+class _V:
+    stopped = False
+    def stop(self): type(self).stopped = True
+
+
+def _arm(item, values):
+    """Do what View._scheduled_task does before the callback: resolve the selection.
+
+    `item.values` reads a private field that discord.py fills from the interaction
+    payload, so calling callback() directly leaves it empty. Filling it here means the
+    test drives the real code path rather than a stubbed-out one.
+    """
+    item._values = values
+
+
+async def _click(fi):
+    _arm(_sel, fi.values)
+    return await _sel.callback(fi)
+
+
+v = _V()
+owner = _Pick(1, [_role], 1, v)
+asyncio.run(_click(owner))
+check("the owner's pick is accepted", len(owner.response.edited) == 1
+      if hasattr(owner.response, "edited") else bool(owner.response.edited), str(owner.response.edited))
+check("picking a role stores it BY ID", D.cfg(_conn, "staff_role_id") == 777,
+      str(D.cfg(_conn, "staff_role_id")))
+check("the confirm button carries the picked role", owner.response.edited and
+      isinstance(owner.response.edited[0].get("view"), ui.SetupProvisionView)
+      and owner.response.edited[0]["view"].staff_role_id == 777,
+      str(owner.response.edited))
+check("the picker that was answered is stopped, not left tappable", v.stopped is True)
+
+stranger = _Pick(2, [_role], 1, _V())
+asyncio.run(_click(stranger))
+check("nobody else can answer someone else's /setup",
+      not stranger.response.edited and bool(stranger.response.sent),
+      f"edited={stranger.response.edited} sent={stranger.response.sent}")
+
+# --- 11. the renamed-role bug the old gate had ----------------------------- #
+# HubView._authorized called is_staff(user) with no id, so it fell back to matching the
+# literal name "Hub Staff" - which contradicts the file's own promise that renaming a role
+# changes nothing. A server whose staff role is called "Quiz Team" could never grade.
+_owner_only = type("U", (), {"id": 9, "guild_permissions": type("P", (), {"administrator": False})(),
+                             "roles": [_role]})()
+check("is_staff honours the stored id, not the name",
+      ui.is_staff(_owner_only, 777) is True and ui.is_staff(_owner_only) is False)
+
+
+class _GateI:
+    def __init__(self, user): self.user, self.response = user, Resp()
+
+
+check("HubView._authorized now lets a renamed staff role through",
+      asyncio.run(_GateI(_owner_only) and ui.HubView(_conn, staff=True)
+                  ._authorized(_GateI(_owner_only))) is True)
+check("…and still refuses a player",
+      asyncio.run(ui.HubView(_conn, staff=True)
+                  ._authorized(_GateI(type("U", (), {"id": 8, "roles": [], "guild_permissions":
+                                                      type("P", (), {"administrator": False})()})())))
+      is False)
+
+
+
 print(f"\n{ok} UI checks passed.")

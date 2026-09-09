@@ -93,13 +93,17 @@ class HubView(discord.ui.View):
         return True
 
     async def _authorized(self, interaction) -> bool:
-        """Second gate. Returns False after telling the user why."""
-        if getattr(self, "staff_only", False) and not is_staff(interaction.user):
-            if not interaction.response.is_done():
-                await interaction.response.send_message(
-                    "That control is for **Hub Staff**.", ephemeral=True)
-            return False
-        return True
+        """Second gate. Returns False after telling the user why.
+
+        Delegates to gate(), the same check a bare Item (StaffRoleSelect) has to use - the
+        divergence between these two is what let `self._authorized` onto a non-View class.
+        """
+        if gate(interaction, getattr(self, "conn", None)):
+            return True
+        if not interaction.response.is_done():
+            await interaction.response.send_message(
+                "That control is for **Hub Staff**.", ephemeral=True)
+        return False
 
     async def on_error(self, interaction, error, item):
         try:
@@ -126,6 +130,33 @@ def is_staff(user, staff_role_id: int | None = None) -> bool:
     if staff_role_id:
         return int(staff_role_id) in {int(r.id) for r in roles}
     return any(getattr(r, "name", None) == HUB_ROLE for r in roles)
+
+
+def gate(interaction, conn, *, staff_only: bool = True, owner_bypass: bool = False) -> bool:
+    """May this interaction proceed? Module level, because BOTH a View and a bare Item
+    need to ask, and an Item has no `_authorized` to inherit.
+
+    owner_bypass is for controls that only exist on an ephemeral message: whoever ran the
+    command is allowed even before `staff_role_id` is stored. Without it the very first
+    /setup deadlocks - the picker's "confirm" button is a staff-only HubView, and at that
+    moment nobody is staff yet.
+    """
+    if not staff_only:
+        return True
+    user = interaction.user
+    if owner_bypass:
+        author = getattr(getattr(interaction, "message", None), "author", None)
+        if author is not None and user.id == author.id:
+            return True
+    return is_staff(user, cfg_safe(conn, "staff_role_id"))
+
+
+def cfg_safe(conn, key, default=None):
+    """cfg() that never raises on a connection object this module may not fully own."""
+    try:
+        return V.dbmod.cfg(conn, key, default)
+    except Exception:
+        return default
 
 
 def install(bot, conn) -> None:
@@ -157,12 +188,34 @@ class StaffRoleSelect(discord.ui.RoleSelect):
         self.conn = conn
 
     async def callback(self, interaction: discord.Interaction):
-        if not await self._authorized(interaction):
+        # NOT self._authorized(): that is a HubView method and this is an Item. It raised
+        # AttributeError on every real click, so the picker looked dead. See ui.gate().
+        if not gate(interaction, self.conn, owner_bypass=True):
+            await interaction.response.send_message(
+                "Only the person who ran `/setup` can pick the staff role.", ephemeral=True)
             return
         role = self.values[0]
+        # The confirm button is staff-only, and until provision() runs nothing is stored -
+        # so record the pick now. provision() re-writes the same key from the same value;
+        # this only exists to let the picker's own author click it.
+        try:
+            V.dbmod.set_cfg(self.conn, "staff_role_id", int(role.id))
+        except Exception:
+            pass                       # a failed convenience write must not eat the click
+        self._view_state_after_pick(interaction)
         await interaction.response.edit_message(
             content=None, embed=setup_plan_embed(interaction, self.conn, role.id),
             view=SetupProvisionView(self.conn, role.id))
+
+    def _view_state_after_pick(self, interaction):
+        """Disable the picker we just consumed, so the message cannot be re-used.
+
+        Two views can hold this same class (the one from /setup and the copy install()
+        registered at boot), and only the interaction carries the live one.
+        """
+        v = getattr(interaction, "view", None)
+        if v is not None:
+            v.stop()
 
 
 def setup_plan_embed(interaction, conn, staff_role_id: int) -> discord.Embed:
@@ -172,6 +225,11 @@ def setup_plan_embed(interaction, conn, staff_role_id: int) -> discord.Embed:
     place where "these already exist, I will adopt them" is shown before it happens.
     """
     guild = interaction.guild
+    if guild is None:
+        # Reached only as a backstop: /setup is @guild_only now, so Discord refuses the
+        # DM itself. Before that guard existed this line was `AttributeError:
+        # 'NoneType' object has no attribute 'roles'` on every DM invocation.
+        raise ValueError("setup_plan_embed needs a guild")
     plan = V.provision_plan(conn)
     names_role = {r.name for r in guild.roles}
     names_chan = {c.name for c in guild.channels}

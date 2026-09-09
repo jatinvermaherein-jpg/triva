@@ -9,6 +9,7 @@ Run standalone (SQLite) or under HUB_TEST_DB for the Postgres-only checks:
     python3 tests/test_deploy.py
     HUB_TEST_DB=postgres://... python3 tests/test_deploy.py
 """
+import ast
 import os
 import pathlib
 import shutil
@@ -141,10 +142,19 @@ def main() -> int:
     for name in ("_SetupAskView", "HubBot", "build_tree", "main"):
         check(f"{name} resolves at module scope", hasattr(M, name))
     views = _drive_setup_hook(M)
-    check("setup_hook registers /setup's persistent view", "_SetupAskView" in views,
+    # The picker is deliberately NOT registered. `add_view` only makes a view resumable
+    # when it is persistent (timeout=None AND a message_id), and this one carries no
+    # message_id, so the old registration was a false promise - after a restart the
+    # ephemeral message is gone and there is nothing to resume. What IS resumable is the
+    # confirm button, SetupProvisionView, and that is in the list below.
+    check("setup_hook does not register a view it cannot resume", "_SetupAskView" not in views,
           "registered: " + ", ".join(sorted(views)))
+    conn = D.connect(":memory:")
+    check("a second /setup works, which is why the above is safe",
+          len(M._SetupAskView(conn).children) == 1)
     check("every persistent view ui.install() promised is on the bot",
-          {"AnswerView", "SubmitView", "HubPanelView"} <= views, str(sorted(views)))
+          {"AnswerView", "SubmitView", "HubPanelView", "SetupProvisionView"} <= views,
+          str(sorted(views)))
 
     # A bad HUB_DB must produce a diagnosis, not a traceback: Railway shows the first
     # lines of a container that restarts every second, and a stack of `raise ... from exc`
@@ -233,15 +243,42 @@ def main() -> int:
     # Every handler that does real work must acknowledge FIRST. Deferring is what keeps
     # the token alive across a Supabase round trip; this is a source check because the
     # race is timing, not logic, and no fake can lose it for us.
-    import re as _re
     src = (ROOT / "bot" / "main.py").read_text()
-    for fn in ("async def setup(i", "async def setup_panel(", "async def clock_tick("):
-        i0 = src.index(fn)
-        body = src[i0:src.index("\n    @", i0 + 10)]
-        first = _re.search(r"await i\.response\.(defer|send_message)", body)
-        check(f"{fn.split()[2].rstrip('(')} defers before it responds",
-              first is not None and first.group(1) == "defer",
-              first.group(0) if first else "no response call found")
+    _mtree = ast.parse(src)
+
+    def _first_response(stmts):
+        """The method name of the first `await i.response.<x>` on the real code path.
+
+        An `if <guard>: return ...` that answers a trivial precondition (e.g. "run this
+        in a server") is skipped wholesale: descending into it would report the guard
+        rather than the handler, and the guard is legitimately a direct reply because it
+        does no work first. Only top-level statements count, so this walks one level and
+        never recurses.
+        """
+        for st in stmts:
+            # A trivial precondition guard (`if not a guild: return "run it in a server"`)
+            # may answer directly and is not the path under review. But skip ONLY when the
+            # guard holds no work at all - with no work, awaiting a reply is right; a branch
+            # that queries or builds first is exactly what has to defer. (Skipping every
+            # `if ... return` instead made this check blind to the real body, and it passed
+            # a build with the defer deleted.)
+            if isinstance(st, ast.If) and isinstance(st.body[-1], ast.Return) \
+                    and not any(isinstance(x, (ast.Await, ast.Assign)) for x in st.body):
+                continue
+            if isinstance(st, (ast.Return, ast.Expr)):
+                node = st.value
+                if isinstance(node, ast.Await) and isinstance(node.value, ast.Call) \
+                        and isinstance(node.value.func, ast.Attribute) \
+                        and isinstance(node.value.func.value, ast.Attribute) \
+                        and node.value.func.value.attr == "response":
+                    return node.value.func.attr
+        return None
+
+    for fn in ("setup", "setup_panel", "clock_tick"):
+        node = next((n for n in ast.walk(_mtree)
+                     if isinstance(n, ast.AsyncFunctionDef) and n.name == fn), None)
+        got = _first_response(node.body) if node else "handler not found"
+        check(f"/{fn.replace('_','-')} defers before it does any work", got == "defer", str(got))
     check("no error handler replies raw any more",
           "await i.response.send_message" not in src[src.index("@setup.error"):
                                                      src.index("@setup.error") + 1400],
