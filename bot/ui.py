@@ -18,7 +18,9 @@ verified offline. Six fixed slots, of which you normally use 2-6, is boring and 
 """
 from __future__ import annotations
 
+import csv
 import datetime as dt
+import io
 import logging
 
 import discord
@@ -320,7 +322,7 @@ def setup_plan_embed(interaction, conn, staff_role_id: int) -> discord.Embed:
                          f"picked, unless it does not exist yet")
             continue
         tag = "♻️" if (r["id"] or r["name"] in names_role) else "🆕"
-        lines.append(f"{tag} **role** {r['name']}")
+        lines.append(f"{tag} **role** {r['name']} · `#{int(r['colour']):06x}`")
     lines.append("")
     if plan["category"]["id"] or V.CATEGORY_NAME in names_chan:
         lines.append(f"♻️ **category** {V.CATEGORY_NAME} — adopting the existing one")
@@ -368,6 +370,11 @@ class _GuildWorkspace:
         return await self.guild.create_role(name=name, colour=discord.Colour(colour),
                                             hoist=hoist, reason=reason)
 
+    async def edit_role(self, role, *, colour=0, hoist=False, reason=None):
+        """Keep managed role appearance consistent across re-runs of /setup."""
+        return await role.edit(colour=discord.Colour(colour), hoist=hoist,
+                               reason=reason)
+
     async def create_category(self, *, name, overwrites=None, reason=None):
         return await self.guild.create_category(name=name,
                                                 overwrites=_to_overwrites(self.guild, overwrites),
@@ -398,6 +405,15 @@ def _to_overwrites(guild, logical):
         out[who[key]] = discord.PermissionOverwrite(
             view_channel=bool(perms["read"]), send_messages=bool(perms["write"]),
             read_message_history=bool(perms["read"]))
+    # A private staff channel denies @everyone, which also includes the bot's
+    # default role.  Add the bot member explicitly so provisioning can immediately
+    # post the panel and guide.  This is deliberately limited to the three channel
+    # permissions above; it never grants Manage Channels/Roles or Administrator.
+    bot_member = getattr(guild, "me", None)
+    if bot_member is not None and any(k == "everyone" and not perms["read"]
+                                     for k, perms in logical.items()):
+        out[bot_member] = discord.PermissionOverwrite(
+            view_channel=True, send_messages=True, read_message_history=True)
     return out
 
 
@@ -437,7 +453,10 @@ class SetupProvisionView(HubView):
                 "⚠️ I need **Manage Roles** and **Manage Channels** to do this, and "
                 "nothing else. Administrator is not required and I will not ask for it.",
                 ephemeral=True)
-        await i.followup.send(embed=provision_report(res), ephemeral=True)
+        workspace = await post_staff_workspace(i.guild, self.conn)
+        report = provision_report(res)
+        report.add_field(name="Staff workspace", value=workspace["message"][:1024], inline=False)
+        await i.followup.send(embed=report, ephemeral=True)
 
     @discord.ui.button(label="✖️ Cancel", style=discord.ButtonStyle.secondary,
                        custom_id=cid("st", "cancel"))
@@ -457,7 +476,7 @@ def provision_report(res) -> discord.Embed:
     e.description = (f"**Created**\n{made}\n\n**Adopted** (already existed — these ids "
                       f"are now what the bot uses)\n{used}")
     e.set_footer(text="Rename or move any of them freely: lookups go by id, never by "
-                       "name. Next step: /season-create")
+                       "name. The staff panel and guide are now in #staff-only.")
     return e
 
 
@@ -1104,6 +1123,304 @@ class PromptAuthorModal(discord.ui.Modal, title="Set the night's prompt"):
 
 
 # --------------------------------------------------------------------------- #
+# the single staff panel
+# --------------------------------------------------------------------------- #
+
+class SeasonCreateModal(discord.ui.Modal, title="Create a Hub season"):
+    """The button replacement for ``/season-create``.
+
+    Discord modal fields are intentionally short and validated before the service
+    layer is called.  The calendar is still built by ``V.create_season`` so the
+    button and the legacy bootstrap command share exactly one rule path.
+    """
+
+    name = discord.ui.TextInput(label="Season name", max_length=80,
+                                placeholder="Season 1")
+    start_day = discord.ui.TextInput(label="Start day YYYY-MM-DD (blank = next Monday)",
+                                     required=False, max_length=10,
+                                     placeholder="2026-09-14")
+    weeks = discord.ui.TextInput(label="Weeks (1-8)", required=False, max_length=1,
+                                 placeholder="4")
+
+    def __init__(self, conn):
+        super().__init__(timeout=900)
+        self.conn = conn
+
+    async def on_submit(self, interaction: discord.Interaction):
+        name = _modal_text(self, "name")
+        raw_day = _modal_text(self, "start_day")
+        raw_weeks = _modal_text(self, "weeks") or "4"
+        if not name:
+            return await interaction.response.send_message(
+                "A season needs a name.", ephemeral=True)
+        try:
+            weeks = int(raw_weeks)
+            if not 1 <= weeks <= 8:
+                raise ValueError
+            if raw_day:
+                dt.date.fromisoformat(raw_day)
+                day = raw_day
+            else:
+                today = dt.date.today()
+                day = (today + dt.timedelta(days=(7 - today.weekday()) % 7 or 7)).isoformat()
+            res = V.create_season(self.conn, name, day, weeks)
+        except (ValueError, TypeError, V.dbmod.IntegrityError) as exc:
+            return await interaction.response.send_message(
+                f"⚠️ Use a valid date and a whole number of weeks from 1 to 8, "
+                f"and choose a new season name. ({exc})", ephemeral=True)
+        await interaction.response.send_message(
+            f"📅 **{name}** created: {res['evenings']} evenings from {day}. "
+            f"Each league has {res['nights_per_league']['l1']} nights.", ephemeral=True)
+
+
+class ChannelWireSelect(discord.ui.ChannelSelect):
+    """Select one text channel to replace ``/setup-channel``."""
+
+    def __init__(self, conn, league: str):
+        self.conn, self.league = conn, league
+        super().__init__(custom_id=cid("ch", league),
+                         channel_types=[discord.ChannelType.text],
+                         placeholder=f"Choose the {league.upper()} posting channel…")
+
+    async def callback(self, interaction: discord.Interaction):
+        parent = self.view
+        if not isinstance(parent, HubView) or not await parent._authorized(interaction):
+            return
+        channel = self.values[0]
+        V.dbmod.set_cfg(self.conn, f"channel:{self.league}", int(channel.id))
+        await interaction.response.edit_message(
+            content=f"✅ {self.league.upper()} now posts in {channel.mention}.",
+            embed=None, view=None)
+
+
+@persistent
+class ChannelConfigView(HubView):
+    """Three small buttons plus a channel select; no channel ids are typed."""
+
+    def __init__(self, conn):
+        super().__init__(conn, staff=True)
+
+    async def choose(self, interaction, league: str):
+        if not await self._authorized(interaction):
+            return
+        e = discord.Embed(title=f"📍 Wire {league.upper()} channel",
+                          description="Pick a text channel. The setting is saved by "
+                                      "Discord id, so renaming it later is safe.",
+                          colour=LEAGUE_META[league][2])
+        await interaction.response.send_message(
+            embed=e, view=_channel_picker_view(self.conn, league), ephemeral=True)
+
+    @discord.ui.button(label="📚 L1 channel", style=discord.ButtonStyle.primary,
+                       custom_id=cid("ch", "pick", "l1"), row=0)
+    async def l1(self, i, b): await self.choose(i, "l1")
+
+    @discord.ui.button(label="⚔️ L2 channel", style=discord.ButtonStyle.primary,
+                       custom_id=cid("ch", "pick", "l2"), row=0)
+    async def l2(self, i, b): await self.choose(i, "l2")
+
+    @discord.ui.button(label="🔧 L3 channel", style=discord.ButtonStyle.primary,
+                       custom_id=cid("ch", "pick", "l3"), row=0)
+    async def l3(self, i, b): await self.choose(i, "l3")
+
+    @discord.ui.button(label="✖️ Close", style=discord.ButtonStyle.secondary,
+                       custom_id=cid("ch", "close"), row=1)
+    async def close(self, i, b):
+        if await self._authorized(i):
+            await i.response.edit_message(content="Closed.", embed=None, view=None)
+
+
+def _channel_picker_view(conn, league: str) -> HubView:
+    view = HubView(conn, staff=True)
+    item = ChannelWireSelect(conn, league)
+    view.add_item(item)
+    cancel = discord.ui.Button(label="✖️ Cancel", style=discord.ButtonStyle.secondary,
+                               custom_id=cid("ch", "cancel", league))
+    cancel.callback = lambda i: _cancel_component(i, view)
+    view.add_item(cancel)
+    check_rows(view)
+    return view
+
+
+async def _cancel_component(interaction, view: HubView):
+    if await view._authorized(interaction):
+        await interaction.response.edit_message(content="Cancelled.", embed=None, view=None)
+
+
+@persistent
+class StaffPanelView(HubView):
+    """All staff operations in one restart-safe, four-row panel.
+
+    The slash commands remain only as a backwards-compatible bootstrap/API surface;
+    normal staff workflow never needs to remember one.  Every operational command
+    has a button here, and all selections/modals defer or acknowledge before doing
+    database/network work.
+    """
+
+    def __init__(self, conn):
+        super().__init__(conn, staff=True)
+        check_rows(self)
+
+    @discord.ui.button(label="📅 Create season", style=discord.ButtonStyle.primary,
+                       custom_id=cid("sp", "season"), row=0)
+    async def create_season(self, i, b):
+        if await self._authorized(i):
+            await i.response.send_modal(SeasonCreateModal(self.conn))
+
+    @discord.ui.button(label="👀 Season preview", style=discord.ButtonStyle.secondary,
+                       custom_id=cid("sp", "preview"), row=0)
+    async def preview(self, i, b):
+        if await self._authorized(i):
+            await i.response.send_message(embed=season_preview_embed(self.conn), ephemeral=True)
+
+    @discord.ui.button(label="📚 Author L1", style=discord.ButtonStyle.primary,
+                       custom_id=cid("sp", "question"), row=0)
+    async def author_question(self, i, b):
+        if await self._authorized(i):
+            await i.response.send_message(
+                embed=discord.Embed(title="📚 Author a League 1 question",
+                                    description="Pick a night, then fill the question modal.",
+                                    colour=LEAGUE_META["l1"][2]),
+                view=PickNightView(self.conn, "question"), ephemeral=True)
+
+    @discord.ui.button(label="⚔️ Set L2/L3", style=discord.ButtonStyle.primary,
+                       custom_id=cid("sp", "prompt"), row=0)
+    async def set_prompt(self, i, b):
+        if await self._authorized(i):
+            await i.response.send_message(
+                embed=discord.Embed(title="⚔️ Set a League 2 / 3 night",
+                                    description="Pick a night, then write the player card.",
+                                    colour=LEAGUE_META["l2"][2]),
+                view=PickNightView(self.conn, "prompt"), ephemeral=True)
+
+    @discord.ui.button(label="📍 Wire channels", style=discord.ButtonStyle.secondary,
+                       custom_id=cid("sp", "channels"), row=0)
+    async def channels(self, i, b):
+        if await self._authorized(i):
+            await i.response.send_message(
+                embed=discord.Embed(title="📍 Channel wiring",
+                                    description="Choose the destination for each league.",
+                                    colour=0x3498db),
+                view=ChannelConfigView(self.conn), ephemeral=True)
+
+    @discord.ui.button(label="▶️ Open tonight", style=discord.ButtonStyle.success,
+                       custom_id=cid("sp", "tonight"), row=1)
+    async def open_tonight(self, i, b):
+        if not await self._authorized(i): return
+        bot = _BOT
+        if bot is None:
+            return await i.response.send_message("⚠️ Bot client is not ready.", ephemeral=True)
+        await i.response.defer(ephemeral=True)
+        count = 0
+        for ev in V.todays_evenings(self.conn):
+            if ev["status"] == "scheduled" and await bot.post_evening(ev):
+                count += 1
+        await i.followup.send(f"Posted {count} league card set(s).", ephemeral=True)
+
+    @discord.ui.button(label="⏱ Run scheduler", style=discord.ButtonStyle.secondary,
+                       custom_id=cid("sp", "tick"), row=1)
+    async def run_tick(self, i, b):
+        if not await self._authorized(i): return
+        bot = _BOT
+        if bot is None:
+            return await i.response.send_message("⚠️ Bot client is not ready.", ephemeral=True)
+        await i.response.defer(ephemeral=True)
+        result = await bot.tick()
+        await i.followup.send(
+            f"Scheduler complete · opened `{result['opened'] or '—'}` · "
+            f"locked `{result['locked'] or '—'}`.", ephemeral=True)
+
+    @discord.ui.button(label="📢 Post hub panel", style=discord.ButtonStyle.primary,
+                       custom_id=cid("sp", "hub"), row=1)
+    async def post_hub(self, i, b):
+        if not await self._authorized(i): return
+        await i.response.defer(ephemeral=True)
+        result = await post_hub_panel(self.conn)
+        await i.followup.send(result["message"], ephemeral=True)
+
+    @discord.ui.button(label="🏆 Post leaderboard", style=discord.ButtonStyle.success,
+                       custom_id=cid("sp", "board"), row=1)
+    async def post_board(self, i, b):
+        if not await self._authorized(i): return
+        await i.response.defer(ephemeral=True)
+        result = await post_board_panel(self.conn)
+        await i.followup.send(result["message"], ephemeral=True)
+
+    @discord.ui.button(label="🧾 Post checkout", style=discord.ButtonStyle.danger,
+                       custom_id=cid("sp", "checkout"), row=1)
+    async def post_checkout(self, i, b):
+        if not await self._authorized(i): return
+        await i.response.defer(ephemeral=True)
+        result = await post_checkout_panel(self.conn)
+        await i.followup.send(result["message"], ephemeral=True)
+
+    @discord.ui.button(label="💰 Queue payouts", style=discord.ButtonStyle.secondary,
+                       custom_id=cid("sp", "payouts"), row=2)
+    async def queue_payouts_button(self, i, b):
+        if not await self._authorized(i): return
+        res = V.queue_payouts(self.conn)
+        await i.response.send_message(
+            f"🧾 {res['created']} checkout(s) queued; {V.pending_count(self.conn)} pending.",
+            ephemeral=True)
+
+    @discord.ui.button(label="📤 Export ledger", style=discord.ButtonStyle.secondary,
+                       custom_id=cid("sp", "export"), row=2)
+    async def export_ledger(self, i, b):
+        if not await self._authorized(i): return
+        await i.response.defer(ephemeral=True)
+        data = ledger_csv(self.conn)
+        await i.followup.send(
+            content=f"{data['rows']} ledger row(s). Every point is traceable.",
+            file=discord.File(io.BytesIO(data["csv"].encode()), filename="hub-ledger.csv"),
+            ephemeral=True)
+
+    @discord.ui.button(label="🏁 Season end", style=discord.ButtonStyle.danger,
+                       custom_id=cid("sp", "end"), row=2)
+    async def season_end(self, i, b):
+        if await self._authorized(i):
+            await i.response.send_message(
+                embed=discord.Embed(title="🏁 Season end",
+                                    description="Dry-run first. Apply only after staff verify it.",
+                                    colour=0xe67e22),
+                view=SeasonAdminView(self.conn), ephemeral=True)
+
+    @discord.ui.button(label="📖 Repost staff guide", style=discord.ButtonStyle.secondary,
+                       custom_id=cid("sp", "guide"), row=2)
+    async def guide(self, i, b):
+        if not await self._authorized(i): return
+        await i.response.defer(ephemeral=True)
+        result = await post_staff_guide(self.conn)
+        await i.followup.send(result["message"], ephemeral=True)
+
+    @discord.ui.button(label="🧭 Wiring status", style=discord.ButtonStyle.secondary,
+                       custom_id=cid("sp", "status"), row=3)
+    async def status(self, i, b):
+        if await self._authorized(i):
+            await i.response.send_message(
+                embed=staff_status_embed(self.conn, i.guild), ephemeral=True)
+
+    @discord.ui.button(label="🧰 Repair setup", style=discord.ButtonStyle.secondary,
+                       custom_id=cid("sp", "repair"), row=3)
+    async def repair(self, i, b):
+        if not await self._authorized(i): return
+        staff_id = _configured_value(self.conn, "staff_role_id")
+        if not staff_id or i.guild is None:
+            return await i.response.send_message(
+                "⚠️ No stored staff role or guild context. Use the one-time `/setup` bootstrap.",
+                ephemeral=True)
+        await i.response.defer(ephemeral=True)
+        try:
+            result = await V.provision(self.conn, _GuildWorkspace(i.guild, self.conn),
+                                       int(staff_id), actor_id=i.user.id)
+            workspace = await post_staff_workspace(i.guild, self.conn)
+            embed = provision_report(result)
+            embed.add_field(name="Staff workspace", value=workspace["message"][:1024], inline=False)
+            await i.followup.send(embed=embed, ephemeral=True)
+        except (ValueError, discord.HTTPException) as exc:
+            await i.followup.send(f"⚠️ Setup repair failed: `{type(exc).__name__}: {exc}`",
+                                  ephemeral=True)
+
+
+# --------------------------------------------------------------------------- #
 # evening / hub / board / season
 # --------------------------------------------------------------------------- #
 
@@ -1211,20 +1528,16 @@ class HubPanelView(HubView):
     @discord.ui.button(label="🛠️ Staff tools", style=discord.ButtonStyle.primary,
                        custom_id=cid("hb", "staff"))
     async def staff_tools(self, i, b):
-        """Authoring and the checkout queue live here, so no staff member ever has
-        to remember a slash command - and no id or date is ever typed."""
-        e = discord.Embed(title="🛠️ Staff tools", colour=0x2f3136)
-        e.description = ("Everything below is pickers and modals. You never type an "
-                         "evening id, a date, or a channel id.")
-        v = HubView(self.conn, staff=True)
-        for label, mode, style in (
-                ("📚 Author a question", "question", discord.ButtonStyle.primary),
-                ("⚔️ Set a night's prompt", "prompt", discord.ButtonStyle.primary),
-                ("🧾 Checkout queue", "checkout", discord.ButtonStyle.danger)):
-            btn = discord.ui.Button(label=label, style=style, custom_id=cid("st", mode))
-            btn.callback = _make_tool_callback(self.conn, mode)
-            v.add_item(btn)
-        await i.response.send_message(embed=e, view=v, ephemeral=True)
+        """Open the same complete panel that is posted in #staff-only.
+
+        Keeping one panel definition prevents the public hub shortcut and the
+        staff-channel panel from drifting apart (the old shortcut only exposed
+        three tools and was also where ``Message.view`` was incorrectly read).
+        """
+        if not await self._authorized(i):
+            return
+        await i.response.send_message(embed=staff_panel_embed(self.conn),
+                                      view=StaffPanelView(self.conn), ephemeral=True)
 
     @discord.ui.button(label="📊 My stats", style=discord.ButtonStyle.secondary,
                        custom_id=cid("hb", "me"))
@@ -1470,6 +1783,225 @@ async def reply(i, *, content=None, embed=None, view=None, file=None, ephemeral=
 
 
 
+def _configured_value(conn, key: str, default=None):
+    try:
+        return V.dbmod.cfg(conn, key, default)
+    except Exception:
+        return default
+
+
+async def _resolve_configured_channel(conn, key: str):
+    """Resolve one stored channel id through the bound client, never by name."""
+    bot = _BOT
+    channel_id = _configured_value(conn, V._hubkey("channel", key))
+    if key == "hub":
+        channel_id = (channel_id or _configured_value(conn, "hub_channel_id")
+                      or _configured_value(conn, "hub:hub"))
+    if not channel_id or bot is None:
+        return None
+    channel = bot.get_channel(int(channel_id)) if hasattr(bot, "get_channel") else None
+    if channel is None and hasattr(bot, "fetch_channel"):
+        try:
+            channel = await bot.fetch_channel(int(channel_id))
+        except discord.HTTPException:
+            return None
+    return channel
+
+
+async def _post_or_update(conn, channel, *, embed, view, message_key: str):
+    """Edit a previously posted panel or create it once, idempotently."""
+    old_id = _configured_value(conn, message_key)
+    if old_id and hasattr(channel, "fetch_message"):
+        try:
+            message = await channel.fetch_message(int(old_id))
+            await message.edit(embed=embed, view=view)
+            return message, False
+        except (discord.NotFound, discord.Forbidden, discord.HTTPException):
+            pass
+    message = await channel.send(embed=embed, view=view)
+    V.dbmod.set_cfg(conn, message_key, int(message.id))
+    V.dbmod.set_cfg(conn, f"{message_key}:channel", int(channel.id))
+    return message, True
+
+
+async def post_hub_panel(conn) -> dict:
+    channel = await _resolve_configured_channel(conn, "hub")
+    if channel is None:
+        return {"ok": False, "message": "⚠️ The provisioned hub channel is unavailable. Run setup/status."}
+    try:
+        message, created = await _post_or_update(
+            conn, channel, embed=hub_embed(conn), view=HubPanelView(conn),
+            message_key="hub_panel_message_id")
+        V.dbmod.set_cfg(conn, "hub_channel_id", int(channel.id))
+        return {"ok": True, "message": f"📢 Hub panel {'posted' if created else 'refreshed'} in {channel.mention}."}
+    except discord.HTTPException:
+        return {"ok": False, "message": "⚠️ Discord refused the hub panel. Check View Channel, Send Messages and Embed Links."}
+
+
+async def post_board_panel(conn) -> dict:
+    channel = await _resolve_configured_channel(conn, "league_table")
+    if channel is None:
+        return {"ok": False, "message": "⚠️ The provisioned league-table channel is unavailable."}
+    try:
+        message, created = await _post_or_update(
+            conn, channel, embed=board_embed(conn, "season", None), view=BoardView(conn),
+            message_key="board_panel_message_id")
+        # board_panels() supports every legacy `board:<message>` key too; retain it
+        # so old pins continue to refresh after this button is used.
+        V.dbmod.set_cfg(conn, f"board:{message.id}", int(channel.id))
+        return {"ok": True, "message": f"📌 Leaderboard {'posted' if created else 'refreshed'} in {channel.mention}."}
+    except discord.HTTPException:
+        return {"ok": False, "message": "⚠️ Discord refused posting the leaderboard."}
+
+
+async def post_checkout_panel(conn) -> dict:
+    channel = await _resolve_configured_channel(conn, "checkout")
+    if channel is None:
+        return {"ok": False, "message": "⚠️ The provisioned pending-checkout channel is unavailable."}
+    try:
+        rows = V.pending_payouts(conn)
+        message, created = await _post_or_update(
+            conn, channel, embed=checkout_embed(conn),
+            view=CheckoutView(conn) if rows else no_controls(),
+            message_key="checkout_panel_message_id")
+        V.dbmod.set_cfg(conn, f"checkout:{message.id}", int(channel.id))
+        return {"ok": True, "message": f"🧾 Checkout {'posted' if created else 'refreshed'} in {channel.mention}."}
+    except discord.HTTPException:
+        return {"ok": False, "message": "⚠️ Discord refused posting the checkout panel."}
+
+
+def ledger_csv(conn) -> dict:
+    output = io.StringIO()
+    writer = csv.writer(output)
+    writer.writerow(("day", "league", "player_id", "points", "reason", "awarded_by", "ts"))
+    rows = conn.execute(
+        "SELECT l.day, l.league, l.player_id, l.points, a.reason, a.applied_by, a.ts "
+        "FROM ledger l LEFT JOIN award a ON a.player_id=l.player_id "
+        "AND a.evening_id=l.evening_id ORDER BY l.day, l.league, l.points DESC").fetchall()
+    writer.writerows(tuple(row) for row in rows)
+    return {"csv": output.getvalue(), "rows": len(rows)}
+
+
+def season_preview_embed(conn) -> discord.Embed:
+    e = discord.Embed(title="👀 Season preview", colour=0x3498db)
+    rows = conn.execute(
+        "SELECT day, league, status, opens_at FROM evening ORDER BY day, league LIMIT 25").fetchall()
+    e.description = "\n".join(
+        f"{LEAGUE_META[r['league']][0]} **{r['day']}** · {r['league'].upper()} · "
+        f"{PHASE.get(r['status'], r['status'])} · {r['opens_at'][:16]}"
+        for r in rows) or "*No season calendar yet. Use Create season.*"
+    e.set_footer(text="Showing the next 25 evenings · times are stored in IST")
+    return e
+
+
+def staff_status_embed(conn, guild=None) -> discord.Embed:
+    e = discord.Embed(title="🧭 Hub status", colour=0x95a5a6)
+    lines = []
+    for key, name, *_ in V.PROVISION_CHANNELS:
+        channel_id = _configured_value(conn, V._hubkey("channel", key))
+        channel = guild.get_channel(channel_id) if guild and channel_id else None
+        lines.append(f"{'✅' if channel else '⚠️'} #{name} · "
+                     f"`{channel_id or 'not wired'}`")
+    role_id = _configured_value(conn, "staff_role_id")
+    role = guild.get_role(role_id) if guild and role_id else None
+    lines.append(f"{'✅' if role else '⚠️'} staff role · `{role_id or 'not selected'}`")
+    e.description = "\n".join(lines)[:4000]
+    e.set_footer(text="Objects are followed by snowflake id; renaming is safe, deleting is reported here.")
+    return e
+
+
+def staff_panel_embed(conn) -> discord.Embed:
+    e = discord.Embed(title="🛠️ The Hub — Staff control panel",
+                      description="Use the buttons below. No command names, channel ids, "
+                                  "evening ids or player ids need to be typed.", colour=0x9b59b6)
+    e.add_field(name="Content", value="📅 create a season · 📚 author L1 · ⚔️ set L2/L3 · 📍 wire channels", inline=False)
+    e.add_field(name="Operations", value="▶️ open tonight · ⏱ run scheduler · 📢 hub · 🏆 leaderboard · 🧾 checkout", inline=False)
+    e.add_field(name="Close-out", value="💰 queue payouts · 📤 export ledger · 🏁 season end · 📖 repost guide · 🧰 repair setup", inline=False)
+    e.set_footer(text="Hub Staff only · every action is audited · safe to use after a restart")
+    return e
+
+
+def staff_guide_embed() -> discord.Embed:
+    e = discord.Embed(title="📖 The Hub staff guide", colour=0x9b59b6)
+    e.description = (
+        "**Daily flow**\n"
+        "1. Author L1 questions or set the L2/L3 card before opening.\n"
+        "2. At the scheduled time use Open tonight only when an immediate post is needed.\n"
+        "3. L1 answers are graded by tapping the correct option; L2/L3 entries use the band buttons.\n"
+        "4. Queue payouts, send the real server reward by hand, then clear each checkout.\n\n"
+        "**Safety**\n"
+        "The bot calculates points, speed bonuses and standings. Staff choose only the correct answer or review band. "
+        "All changes are audited. A stale button is harmless: the service checks the evening state before writing.\n\n"
+        "**Restart and limits**\n"
+        "Panels use persistent custom ids and SQLite/Postgres state, so restarting the bot does not reset a night. "
+        "Question cards allow 2–4 answer buttons, tool panels stay within Discord's 5-buttons-per-row and 25-item limits, "
+        "and long exports are sent as a file rather than an embed.\n\n"
+        "**Permissions**\n"
+        "Only the selected staff role or a server administrator can use this panel. The bot needs View Channel, Send Messages, "
+        "Embed Links, Read Message History, Manage Channels and Manage Roles; it never grants staff management permissions."
+    )
+    e.set_footer(text="Need to rebuild wiring? The one-time bootstrap is /setup mode:SETUP; after that use this panel.")
+    return e
+
+
+async def post_staff_guide(conn, guild=None) -> dict:
+    channel = await _resolve_configured_channel(conn, "staff")
+    if channel is None and guild is not None:
+        channel_id = _configured_value(conn, V._hubkey("channel", "staff"))
+        channel = guild.get_channel(channel_id) if channel_id else None
+    if channel is None:
+        return {"ok": False, "message": "⚠️ The provisioned #staff-only channel is unavailable."}
+    try:
+        old_id = _configured_value(conn, "staff_guide_message_id")
+        if old_id:
+            try:
+                msg = await channel.fetch_message(int(old_id))
+                await msg.edit(embed=staff_guide_embed())
+                return {"ok": True, "message": "📖 Staff guide refreshed in #staff-only."}
+            except (discord.NotFound, discord.Forbidden, discord.HTTPException):
+                pass
+        msg = await channel.send(embed=staff_guide_embed())
+        V.dbmod.set_cfg(conn, "staff_guide_message_id", int(msg.id))
+        return {"ok": True, "message": "📖 Staff guide posted in #staff-only."}
+    except discord.HTTPException:
+        return {"ok": False, "message": "⚠️ Discord refused posting the staff guide."}
+
+
+async def post_staff_workspace(guild, conn) -> dict:
+    """Post both the panel and guide immediately after provisioning.
+
+    This is intentionally idempotent: setup may be run again after a restart or a
+    deleted channel. Existing messages are edited where possible, not spammed into
+    the staff channel on every deployment.
+    """
+    channel_id = _configured_value(conn, V._hubkey("channel", "staff"))
+    channel = guild.get_channel(channel_id) if guild and channel_id else None
+    if channel is None and _BOT is not None and channel_id:
+        try:
+            channel = await _BOT.fetch_channel(int(channel_id))
+        except discord.HTTPException:
+            channel = None
+    if channel is None:
+        return {"ok": False, "message": "⚠️ Staff channel was provisioned but could not be fetched; use Repost staff guide after ready."}
+    try:
+        panel_id = _configured_value(conn, "staff_panel_message_id")
+        if panel_id:
+            try:
+                panel = await channel.fetch_message(int(panel_id))
+                await panel.edit(embed=staff_panel_embed(conn), view=StaffPanelView(conn))
+            except (discord.NotFound, discord.Forbidden, discord.HTTPException):
+                panel = await channel.send(embed=staff_panel_embed(conn), view=StaffPanelView(conn))
+                V.dbmod.set_cfg(conn, "staff_panel_message_id", int(panel.id))
+        else:
+            panel = await channel.send(embed=staff_panel_embed(conn), view=StaffPanelView(conn))
+            V.dbmod.set_cfg(conn, "staff_panel_message_id", int(panel.id))
+        guide = await post_staff_guide(conn, guild)
+        return {"ok": True, "message": "🛠️ Staff panel and guide are live in #staff-only. "
+                                    + guide["message"]}
+    except discord.HTTPException:
+        return {"ok": False, "message": "⚠️ Setup completed, but Discord refused the staff panel post. Check the bot role's channel access."}
+
+
 _BOT = None
 
 
@@ -1581,10 +2113,26 @@ def checkout_embed(conn, page: int = 0, note: str | None = None) -> discord.Embe
     return e
 
 
-def _make_tool_callback(conn, mode: str):
+def _make_tool_callback(conn, mode: str, parent_view: HubView | None = None):
+    """Build a callback for a staff-tool button without reading ``message.view``.
+
+    ``discord.Message`` deliberately has no ``view`` attribute.  The live view is
+    owned by the component item (``button.view``), and callbacks created with a
+    closure can safely keep the parent view that performed the authorization.  The
+    old implementation looked for a view on the message object; every click then
+    raised ``AttributeError`` before the tool could answer, exactly as the Railway
+    log reported.  Keeping the gate explicit also makes dynamically-added buttons
+    follow the same permission path as decorated buttons.
+    """
     async def _tool(interaction: discord.Interaction):
-        view = interaction.message.view if interaction.message else None
-        if isinstance(view, HubView) and not await view._authorized(interaction):
+        if parent_view is not None:
+            allowed = await parent_view._authorized(interaction)
+        else:
+            allowed = gate(interaction, conn)
+            if not allowed and not interaction.response.is_done():
+                await interaction.response.send_message(
+                    "That control is for **Hub Staff**.", ephemeral=True)
+        if not allowed:
             return
         if mode == "checkout":
             e = checkout_embed(conn)
