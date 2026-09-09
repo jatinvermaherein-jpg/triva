@@ -342,6 +342,82 @@ picker-stopped, id-stored — plus a class-hierarchy scan that fails if any `Ite
 reaches for a `View`-only private method. That scan is what finds this bug without a live
 Discord, and it caught a typo of mine while I was writing it.
 
+### The /setup dead-ends: "the application did not respond", nothing created, empty log
+
+The fix above corrected `_authorized`, the in-callback half of the check. The **dispatcher** half
+was left matching the role *name*, and three more faults sat behind it. Together they produced one
+symptom with no evidence: `/setup mode:SETUP` timing out, no channels, and a blank Railway log.
+
+- **`interaction_check` matched `"Hub Staff"` by name.** It ran `is_staff(user)` with no stored id,
+  so it fell back to the literal string — the exact bug already fixed one section above, in the
+  *other* gate. Because discord.py runs `interaction_check` **first**, it refused every staff
+  control before the corrected callback gate could allow it, on any server whose staff role is
+  named anything else. Which is every server that used the picker, since the picker exists to
+  choose that role. It now calls the same `ui.gate()` as everything else.
+- **The owner bypass could never fire.** It compared `interaction.user.id` against
+  `message.author.id` — but a bot's ephemeral message is authored by the **bot**, so that was
+  always bot-id vs human-id. The bypass existed and was dead code. Discord answers this properly
+  with `message.interaction_metadata.user`, so that is what is read now, with the author check
+  kept as a fallback. `SetupProvisionView` also has to *pass* `owner_bypass=True`; it never did,
+  so the "Create everything" button refused the non-admin who had just been told to press it.
+- **Re-running `/setup` was silently dead.** `main.py` called `view.stop()` on the picker whenever
+  a staff role was already stored, reasoning that a re-run "only re-confirms" it. But `stop()`
+  unregisters the view, and `View._dispatch_item` returns `None` for a finished view — the click is
+  discarded **before** the callback, so no reply is ever sent and Discord shows "did not respond".
+  The dropdown still rendered and still looked tappable. Re-running `/setup` is the documented
+  repair for a deleted channel, so it has to work; the `stop()` is gone.
+- **`HubView.on_error` hid the evidence.** It replaced discord.py's default handler with
+  `response.send_message` under `except discord.HTTPException: pass`, and logged nothing. A
+  callback that had already deferred raised `InteractionResponded` — a `ClientException`, which
+  that clause does not catch — so the handler meant to explain the failure failed itself. It now
+  logs with a traceback first and answers through `ui.reply()`, which tolerates a spent token.
+
+The fourth reason the log was empty is not Discord's fault: Railway reads stdout through a pipe,
+and Python block-buffers a pipe in 8 KB chunks, so a bot logging a few hundred bytes an hour shows
+**nothing** for hours while running perfectly. `main()` now line-buffers stdout, points
+`basicConfig` at it, and passes `log_handler=None` to `bot.run()` so discord.py does not install a
+second handler that double-prints every gateway line.
+
+Eight regression checks cover these, and all eight fail against the previous commit: the two gates
+under a renamed role, the owner bypass against bot-authored metadata (accepted for the invoker,
+refused for a passer-by), the confirm view carrying the bypass, discord.py's drop-on-stopped-view
+behaviour, and `on_error` both logging and replying. The buffering and handler fixes are asserted
+in `tests/test_deploy.py`, which also fails if `/setup` ever regains a `.stop()` call.
+
+### 12 of the 14 commands did not exist, and 338 tests said they did
+
+With the log finally readable, the next deploy showed a `Forbidden` traceback from
+`setup_panel` — and, more revealingly, that `/season-create`, `/question-add` and ten others were
+simply absent from Discord. They were absent from the *bot*: every command from `/setup-channel`
+down was indented one level too deep, landing inside `_setup_status()` **after its `return e`**.
+Unreachable code. `build_tree()` ended 240 lines early, registered two commands, and never reached
+`@bot.tree.error` — so the tree's error handler was the library default the whole time, which is
+why failures arrived as tracebacks that told the operator nothing.
+
+The test suite reported green throughout, and the reason is worth recording: every structural check
+in `test_deploy.py` used `ast.walk()`, which descends into nested scopes. A command defined in the
+wrong function, below a `return`, is *syntactically identical* to a registered one from `ast.walk`'s
+point of view. The suite was asking "is this code written?" when the only question that matters is
+"is this command **on the tree**?" It now builds a real `HubBot`, calls `build_tree()`, and asserts
+the 13 names against `tree.get_commands()` — plus a rule that no function may define another
+function after a `return`, which is the shape that caused it. Both fail loudly on the previous
+commit.
+
+Three smaller things came out of the same deploy:
+
+- The command was registered as **`setup_panel`** (discord.py derives the name from the function)
+  while the README and the operator checklist both say **`/setup-panel`**. It is now named
+  explicitly, and the tests cross-check every documented `/name` against the live tree.
+- `setup_panel` wrote `hub_channel_id` to config **before** attempting the post. When the post
+  raised 403 the pointer was already saved, so the 16:00 scheduler would have failed into that same
+  unusable channel every night after. Permissions are checked first now, and a `Forbidden` that
+  slips through anyway rolls the pointer back.
+- `50001 Missing Access` means both "I cannot see it" and "I cannot post in it", and the traceback
+  named neither the channel nor the permission. `_missing_perms()` asks `permissions_for` up front
+  and answers with the exact toggle — "missing **Send Messages** in #staff-only" — while degrading
+  to the old try/except when it cannot compute an answer, so it can never block a legitimate post.
+  `/pin-board` and `/pin-checkout` had the identical write-then-fail ordering and are fixed too.
+
 ### If the build fails
 
 | log line | cause | fix |

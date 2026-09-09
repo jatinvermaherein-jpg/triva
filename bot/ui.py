@@ -86,13 +86,24 @@ class HubView(discord.ui.View):
     able to let a player grade their own night.
     """
 
-    def __init__(self, conn, *, staff: bool = False):
+    def __init__(self, conn, *, staff: bool = False, owner_bypass: bool = False):
         super().__init__(timeout=None)
         self.conn = conn
         self.staff_only = staff
+        # owner_bypass lets the person who ran the command use the controls on their own
+        # ephemeral message before any staff role is stored. Without it the very first
+        # /setup on a fresh server can never be confirmed by anyone but an administrator.
+        self.owner_bypass = owner_bypass
 
     async def interaction_check(self, interaction: discord.Interaction) -> bool:
-        if self.staff_only and not is_staff(interaction.user):
+        # The STORED ID, not the bare name. This is the same renamed-role bug that was
+        # already fixed in _authorized() and left here: is_staff(user) with no id falls
+        # back to matching the literal string "Hub Staff", so on a server whose staff
+        # role is called anything else every staff control answered "That control is for
+        # Hub Staff" and stopped - including /setup's own "Create everything" button,
+        # which is why setup produced no channels and no log line.
+        if self.staff_only and not gate(interaction, getattr(self, "conn", None),
+                                        owner_bypass=self.owner_bypass):
             await interaction.response.send_message(
                 "That control is for **Hub Staff**.", ephemeral=True)
             return False
@@ -104,7 +115,8 @@ class HubView(discord.ui.View):
         Delegates to gate(), the same check a bare Item (StaffRoleSelect) has to use - the
         divergence between these two is what let `self._authorized` onto a non-View class.
         """
-        if gate(interaction, getattr(self, "conn", None)):
+        if gate(interaction, getattr(self, "conn", None),
+                owner_bypass=getattr(self, "owner_bypass", False)):
             return True
         if not interaction.response.is_done():
             await interaction.response.send_message(
@@ -112,12 +124,17 @@ class HubView(discord.ui.View):
         return False
 
     async def on_error(self, interaction, error, item):
-        try:
-            await interaction.response.send_message(
-                f"⚠️ That control failed: `{type(error).__name__}: {error}`",
-                ephemeral=True)
-        except discord.HTTPException:
-            pass
+        # Log FIRST. discord.py's default handler is what used to print these, and this
+        # override replaced it with a silent `except HTTPException: pass` - so a control
+        # that raised (a permissions error inside provision(), say) produced no Railway
+        # line at all and no message to the user, just a spinner that never resolves.
+        log.exception("control %s failed", getattr(item, "custom_id", item), exc_info=error)
+        # reply(), not response.send_message(): by the time a callback raises it has very
+        # often already deferred, and send_message on a deferred interaction raises
+        # InteractionResponded - a ClientException, which the old `except HTTPException`
+        # did NOT catch. The handler meant to explain the failure was itself failing.
+        await reply(interaction,
+                    content=f"⚠️ That control failed: `{type(error).__name__}: {error}`")
 
 
 def is_staff(user, staff_role_id: int | None = None) -> bool:
@@ -150,11 +167,39 @@ def gate(interaction, conn, *, staff_only: bool = True, owner_bypass: bool = Fal
     if not staff_only:
         return True
     user = interaction.user
-    if owner_bypass:
-        author = getattr(getattr(interaction, "message", None), "author", None)
-        if author is not None and user.id == author.id:
-            return True
+    if owner_bypass and _is_own_message(interaction, user):
+        return True
     return is_staff(user, cfg_safe(conn, "staff_role_id"))
+
+
+def _is_own_message(interaction, user) -> bool:
+    """Did `user` cause the message this component sits on?
+
+    NOT `message.author`: every message the bot sends is authored by the BOT, so on a
+    real /setup the old check compared the staff member's id against the bot's own id and
+    was False every single time - the owner bypass existed but never once fired, and the
+    first /setup on a server with no stored staff role could only be finished by an
+    administrator. Discord answers this properly with interaction_metadata.user (the human
+    whose command produced the message), so ask that first and keep the author comparison
+    only as a fallback for a webhook shape that carries no metadata.
+    """
+    msg = getattr(interaction, "message", None)
+    if msg is None or user is None:
+        return False
+    meta = getattr(msg, "interaction_metadata", None)
+    meta_user = getattr(meta, "user", None)
+    if meta_user is not None:
+        try:
+            return int(meta_user.id) == int(user.id)
+        except (TypeError, ValueError):
+            return False
+    author = getattr(msg, "author", None)
+    if author is None:
+        return False
+    try:
+        return int(author.id) == int(user.id)
+    except (TypeError, ValueError):
+        return False
 
 
 def cfg_safe(conn, key, default=None):
@@ -365,7 +410,11 @@ class SetupProvisionView(HubView):
         # Default 0 on purpose: install() rebuilds every persistent view with only
         # (conn,) after a restart, so the id comes from config - which is exactly
         # why /setup stores it. A button clicked days later still knows who asked.
-        super().__init__(conn, staff=True)
+        # owner_bypass mirrors the picker: this view lives on the SAME ephemeral message,
+        # and on a fresh server nobody holds the staff role yet at the moment it is
+        # clicked. Without it the first /setup dead-ends at "That control is for Hub
+        # Staff" - the button that creates every channel refusing the person creating them.
+        super().__init__(conn, staff=True, owner_bypass=True)
         self.staff_role_id = int(staff_role_id)
 
     @discord.ui.button(label="✅ Create everything", style=discord.ButtonStyle.success,

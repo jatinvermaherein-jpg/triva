@@ -156,6 +156,74 @@ def main() -> int:
           {"AnswerView", "SubmitView", "HubPanelView", "SetupProvisionView"} <= views,
           str(sorted(views)))
 
+    # ---------------------------------------- /setup must survive being run a second time
+    # The picker was stop()ed whenever a staff role was already stored. A stopped view is
+    # unregistered from the dispatcher and discord.py discards the click BEFORE the
+    # callback (`_dispatch_item` returns None on a finished view) - so every /setup
+    # mode:SETUP after the first showed a dropdown that answered nothing and logged
+    # nothing. Re-running it is the documented repair for a deleted channel, so it has to
+    # work. The source is the assertion because the guard is the ABSENCE of a call.
+    _src = (ROOT / "bot" / "main.py").read_text()
+    _setup_body = _src[_src.index("async def setup("):_src.index("@setup.error")]
+    # Comments stripped first: the fix documents itself by NAMING view.stop(), and a raw
+    # substring search would match the explanation and fail on correct code.
+    _setup_code = "\n".join(ln.split("#", 1)[0] for ln in _setup_body.splitlines())
+    check("/setup never stops the picker it just sent (that would drop the click)",
+          ".stop()" not in _setup_code, _setup_code[-400:])
+
+    # ------------------------------------------------- the log Railway was not being sent
+    # Railway reads the container's stdout through a pipe, and Python block-buffers a pipe
+    # in 8 KB chunks. A low-volume bot then shows an entirely EMPTY deploy log while it is
+    # running fine - which is what made this bug unreadable from the outside.
+    check("stdout is line-buffered so Railway sees a log at all",
+          "line_buffering=True" in _src, "sys.stdout.reconfigure is missing")
+    check("logging goes to stdout, where Railway collects it",
+          "stream=sys.stdout" in _src)
+    check("discord.py is told not to add a second, duplicate handler",
+          "log_handler=None" in _src, "bot.run() would double every gateway line")
+
+    # ------------------------------ the commands actually ON the tree, not merely written
+    # Every other check in this file walks the AST, and `ast.walk` descends into nested
+    # scopes - so a command indented one level too deep, sitting after a `return` inside
+    # ANOTHER function, looks identical to a registered one. It is not: it is dead code
+    # that never executes, and 12 of the 14 commands were in exactly that state while this
+    # suite reported green. Build the real tree and ask IT what exists.
+    from discord.app_commands.tree import CommandTree as _CT
+
+    _b = M.HubBot(D.connect(":memory:"))
+    _default_on_error = _CT.on_error
+    M.build_tree(_b)
+    _live = {c.name for c in _b.tree.get_commands()}
+    _want = {"setup", "setup-panel", "setup-channel", "season-create", "season-preview",
+             "question-add", "scenario-set", "pin-board", "pin-checkout", "queue-payouts",
+             "tonight", "clock-tick", "export"}
+    check("every documented command is really registered on the tree",
+          _want <= _live, "MISSING: " + ", ".join(sorted(_want - _live)))
+    check("the command tree's error handler is installed (not still the library default)",
+          getattr(_b.tree.on_error, "__func__", _b.tree.on_error) is not _default_on_error,
+          "@bot.tree.error never ran, so failures print a traceback and tell nobody")
+    # The names in the docs are the names a human types. A mismatch is a command that
+    # cannot be found, which is indistinguishable from a bot that is down.
+    for _doc in (ROOT / "README.md", ROOT / "03-OPERATOR-KIT.md"):
+        for _name in sorted(_want):
+            if "/" + _name in _doc.read_text():
+                check(f"{_doc.name} documents /{_name}, and /{_name} exists",
+                      _name in _live)
+
+    # No command may be defined below a `return` in the function that owns it - the shape
+    # that produced the outage above. Checked structurally so it cannot come back.
+    for _fn in ast.walk(ast.parse(_src)):
+        if not isinstance(_fn, ast.FunctionDef):
+            continue
+        _returned = False
+        for _st in _fn.body:
+            if isinstance(_st, ast.Return):
+                _returned = True
+            elif _returned and isinstance(_st, (ast.FunctionDef, ast.AsyncFunctionDef)):
+                check(f"{_fn.name}: no command defined after its return", False,
+                      f"{_st.name} at line {_st.lineno} is unreachable dead code")
+    check("no command hides after a return statement", True)
+
     # A bad HUB_DB must produce a diagnosis, not a traceback: Railway shows the first
     # lines of a container that restarts every second, and a stack of `raise ... from exc`
     # frames teaches a volunteer nothing about which variable is wrong.
