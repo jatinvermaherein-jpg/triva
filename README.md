@@ -290,9 +290,37 @@ Two rules follow, both asserted in `tests/test_deploy.py`:
    a genuine bug is not mistaken for a lost race. `SETUP_NOTES` says "enable Members intent":
    that one *is* required, unlike Message Content.
 
+### The staff permission check, and the bug the first real click exposed
 
+Permission is enforced twice on purpose (`interaction_check` **and** an in-callback gate), but
+the in-callback half was a **method on `HubView`** — and the staff-role picker in `/setup` is a
+`discord.ui.RoleSelect`, an *Item*, which has never had that method. Clicking it raised
+`AttributeError`, and the base `View.on_error` *logs and discards*, so what the user saw was a
+select box that did nothing. Fixed by moving the check to a module-level
+`ui.gate(interaction, conn, owner_bypass=…)` that both a View and a bare Item can call;
+`HubView._authorized` now delegates to it, so the "check it twice" promise has one definition.
+
+Two quieter bugs came out of the same hole:
+
+- `_authorized` called `is_staff(user)` **without the stored id**, falling back to matching the
+  literal name `"Hub Staff"`. That contradicts this project's own rule — the id decides, a rename
+  must not matter — and would have locked every grading button out of any server whose staff role
+  is called something else. It passes `staff_role_id` now.
+- The picker needs `owner_bypass`: the confirm button is staff-only, and at the moment you choose
+  the *first-ever* staff role, nobody is staff yet. Selecting the role now stores the id at once
+  (idempotent — `provision()` writes the same key from the same value), so the person doing the
+  setup can click confirm without being an administrator.
+
+`tests/test_bot_ui.py` drives the real callback and asserts owner-accepted, stranger-refused,
+picker-stopped, id-stored — plus a class-hierarchy scan that fails if any `Item` in `ui.py`
+reaches for a `View`-only private method. That scan is what finds this bug without a live
+Discord, and it caught a typo of mine while I was writing it.
+
+### If the build fails
 
 | log line | cause | fix |
+|---|---|---|
+| `AttributeError: 'StaffRoleSelect' object has no attribute '_authorized'`, beside `Ignoring exception in view <_SetupAskView …>` | a bare `ui.Item` calling a `HubView` method; `View.on_error` swallowed it, so the control looked inert | fixed by `ui.gate()` above. If your log *also* shows `timeout=900.0` on that view, you are not running this repo — that class has read `timeout=None` in every commit pushed |
 | `✖ No start command detected` + `railpack prepare exited with an error` | Railway now builds with **Railpack 0.39**, not Nixpacks. Railpack does **not** read `railway.json`'s `deploy.startCommand`; it autodetects, and there was no `main.py`/`app.py` in the repo root | fixed by the root `main.py` shim (below). Verify with `railpack prepare . --error-missing-start`, or pin Settings → Deploy → Start Command in the dashboard |
 | `Failed to ensure mise is installed` | Railpack provisions Python through `mise`, which wants a writable cache dir | nothing to do in the repo; it runs as root in the builder. Locally set `RAILPACK_CACHE_DIR` |
 | `invalid type: map, expected a sequence for key 'providers'` | an old `nixpacks.toml` from before this fix, still in your working copy | delete `nixpacks.toml`; it is not needed |

@@ -1,5 +1,40 @@
 # Build status — v4.0 refactor
 
+## 2026-09-09 (newest) — first real click on the staff picker, and it was inert
+
+`AttributeError: 'StaffRoleSelect' object has no attribute '_authorized'`, twice, prefixed
+`Ignoring exception in view <_SetupAskView timeout=900.0 children=1>`. A `RoleSelect` is a
+`discord.ui.Item`; `_authorized` is a `HubView` (View) method. The other eleven call sites all
+sit inside `HubView` subclasses, which is why copying the line read as safe — and
+`View.on_error`'s default handler *logs and discards*, so the symptom was a control that silently
+did nothing rather than a visible failure.
+
+Fixed: the check moved to module-level `ui.gate()`, callable by both. Same pass closed two more —
+`_authorized` was calling `is_staff(user)` **without** the stored `staff_role_id`, falling back to
+matching the literal name "Hub Staff" (exactly the rename-fragility this project promises not to
+have, and it would have locked out the very role being created), and the picker needed
+`owner_bypass` plus an immediate `set_cfg("staff_role_id", …)` so the person choosing the
+first-ever staff role can click the staff-only confirm button without being an administrator.
+`/setup` is now `@guild_only()` too: `setup_plan_embed` dereferenced `interaction.guild`
+unguarded, so invoking it from a DM was an `AttributeError` waiting to happen.
+
+Also removed a false promise: `setup_hook` no longer `add_view()`s the picker. A view resumes only
+when it is persistent, and this one carries no message_id — `SetupProvisionView` (persistent,
+id-bearing) is the part that survives a restart, and it stays registered.
+
+Verified by driving the actual callback in `test_bot_ui.py` (118 checks) and a class-hierarchy
+scan that fails if any `Item` in `ui.py` references a `View`-only private method — that scan
+caught a typo of mine (`ui_gate`) while I was writing it. Both new deploy checks were
+negative-controlled; deleting `/setup`'s `defer` initially still passed because my source check
+skipped every `if ... return`, including the real body. It now skips only a guard that contains
+no work, and it fails when the defer is removed.
+
+**Open question for the operator:** the container logs `timeout=900.0` for `_SetupAskView`, but
+that class has read `timeout=None` in every commit ever pushed, and the `on_error` added in
+`630e98c` (pushed 08:39) was absent from a 09:03 deploy. The running image may not be `main` —
+worth confirming in Railway → Deployments before chasing further ghosts.
+
+
 ## 2026-09-09 (latest) — bot is LIVE on Discord; `/setup` was answerable too late
 
 `registered 11 persistent views` … `Shard ID None has connected to Gateway` …
