@@ -11,6 +11,8 @@
 __pycache__/
 *.pyc
 .pytest_cache/
+.pytest_tmp/          # the suites' scratch databases; untracked but easy to `git add -A`
+hub.db                 # running --check from a checkout drops this in the repo root
 .venv/
 venv/
 .mypy_cache/
