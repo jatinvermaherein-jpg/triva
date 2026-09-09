@@ -1284,6 +1284,42 @@ def board_embed(conn, scope: str = "season", league: str | None = None) -> disco
     return e
 
 
+# --------------------------------------------------------------------------- #
+# Answering an interaction without ever raising
+# --------------------------------------------------------------------------- #
+async def reply(i, *, content=None, embed=None, view=None, file=None, ephemeral=True):
+    """Answer `i` however it currently can be answered, and never propagate a 404.
+
+    One function instead of 72 hand-written `i.response.send_message(...)` sites, because
+    a slash command's token dies on its own: the 3-second response window, a gateway
+    reconnect, or a container restart between the command and the answer each make every
+    reply method raise NotFound - including from inside the error handler that was meant
+    to explain the problem. The branch order mirrors discord.py's own state machine
+    (`is_done()` is False until something is sent, and a deferred reply counts as done).
+    Returns "replied" or "dropped"; callers never have to handle either.
+    """
+    kw = {k: v for k, v in (("content", content), ("embed", embed),
+                            ("view", view), ("file", file)) if v is not None}
+    if not kw:
+        # edit_original_response() with no fields is a Discord 500, not a no-op. A caller
+        # with nothing to say is a bug in the caller, so keep it loud but legal.
+        kw = {"content": None}
+    try:
+        if i.response.is_done():
+            await i.edit_original_response(**kw)     # deferred placeholder, or a re-answer
+        else:
+            await i.response.send_message(**kw, ephemeral=ephemeral)
+        return "replied"
+    except (discord.NotFound, discord.HTTPException) as exc:
+        # NotFound is the expired token. A 400 ("interaction already responded to") or a
+        # 403 is equally not worth a traceback: by now the database write has happened, so
+        # the only thing left to do is inform - and inform without breaking if we cannot.
+        if not isinstance(exc, discord.NotFound) and getattr(exc, "status", 0) not in (400, 403, 404):
+            raise                                    # a real problem stays a real problem
+    return "dropped"
+
+
+
 _BOT = None
 
 

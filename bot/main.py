@@ -49,6 +49,12 @@ class _SetupAskView(discord.ui.View):
         self.conn = conn
         self.add_item(ui.StaffRoleSelect(conn))
 
+    async def on_error(self, interaction, error, item):
+        # timeout=None means no default handler: without this a raise here is logged and
+        # the picker just sits there looking tappable forever.
+        log.exception("setup role picker failed", exc_info=error)
+        await ui.reply(interaction, content=f"⚠️ Could not use that: `{type(error).__name__}`")
+
 
 class HubBot(commands.Bot):
     def __init__(self, conn):
@@ -401,12 +407,13 @@ def build_tree(bot: HubBot) -> None:
     @bot.tree.command(description="Post The Hub panel with tonight's leagues")
     @app_commands.checks.has_permissions(administrator=True)
     async def setup_panel(i: discord.Interaction, channel: discord.TextChannel):
+        await i.response.defer(ephemeral=True)   # posts to another channel before answering
         D.set_cfg(bot.hub_conn, "hub_channel_id", channel.id)
         e = ui.hub_embed(bot.hub_conn)
         msg = await channel.send(embed=e, view=ui.HubPanelView(bot.hub_conn))
         bot.hub_channel_id = channel.id
-        await i.response.send_message(f"Pinned panel is live in {channel.mention} "
-                                      f"(message {msg.id}).", ephemeral=True)
+        await ui.reply(i, content=f"Pinned panel is live in {channel.mention} "
+                                  f"(message {msg.id}).")
 
     # ------------------------------------------------------------------ #
     # /setup - the one command. Ask a question, create the whole server.
@@ -420,29 +427,41 @@ def build_tree(bot: HubBot) -> None:
     async def setup(i: discord.Interaction,
                     mode: Literal["plan", "status", "setup"] = "plan") -> None:
         conn = i.client.conn
+        # Defer FIRST, before touching the database. Every branch below reads config and
+        # walks the guild; a slow WAN round trip to Supabase that slips past 3s makes
+        # Discord forget the interaction entirely, and the answer then 404s no matter how
+        # correct it is. "Thinking..." is always cheaper than an unanswerable command.
+        await i.response.defer(ephemeral=True)
         if mode == "plan":
-            return await i.response.send_message(
-                embed=ui.setup_plan_embed(i, conn, D.cfg(conn, "staff_role_id") or 0),
-                ephemeral=True)
+            return await ui.reply(i, embed=ui.setup_plan_embed(
+                i, conn, D.cfg(conn, "staff_role_id") or 0))
         if mode == "status":
-            return await i.response.send_message(
-                embed=_setup_status(conn, i.guild), ephemeral=True)
+            return await ui.reply(i, embed=_setup_status(conn, i.guild))
         view = _SetupAskView(conn)
         if D.cfg(conn, "staff_role_id"):
             view.stop()      # already wired; SETUP would only re-confirm it
-        await i.response.send_message(
-            "Which role should **run the quizzes**? Its members get every staff control, "
-            "and the id is stored - renaming that role later changes nothing.\n"
-            "I need **Manage Roles** and **Manage Channels** to do this, and nothing else.",
-            view=view, ephemeral=True)
+        await ui.reply(i, view=view,
+                       content="Which role should **run the quizzes**? Its members get every "
+                               "staff control, and the id is stored - renaming that role later "
+                               "changes nothing.\nI need **Manage Roles** and **Manage "
+                               "Channels** to do this, and nothing else.")
 
     @setup.error
     async def setup_error(i: discord.Interaction, error):
         if isinstance(error, discord.app_commands.MissingPermissions):
-            return await i.response.send_message(
-                "⚠️ That needs **Manage Roles** + **Manage Channels** on your account, "
-                "not on the bot. Administrator is not required.", ephemeral=True)
+            return await ui.reply(
+                i, content="⚠️ That needs **Manage Roles** + **Manage Channels** on "
+                            "your account, not on the bot. Administrator is not required.")
+        if isinstance(error, discord.NotFound) or isinstance(error.__cause__, discord.NotFound):
+            # The command ran fine; only the channel to answer through was gone. Say so in
+            # a sentence instead of a traceback on a race nobody caused.
+            log.warning("setup answered too late - the interaction had already expired")
+            return await ui.reply(
+                i, content="⚠️ My reply could not be delivered (the command timed out). "
+                           "Nothing was created - run /setup again; a gateway reconnect is the "
+                           "usual cause and the second try always lands.")
         log.exception("setup failed", exc_info=error)
+        await ui.reply(i, content=f"⚠️ Setup failed: `{type(error).__name__}`")
 
 
 def _setup_status(conn, guild) -> discord.Embed:
@@ -649,9 +668,10 @@ def _setup_status(conn, guild) -> discord.Embed:
     @bot.tree.command(name="clock-tick", description="Run the scheduler immediately")
     @app_commands.checks.has_permissions(administrator=True)
     async def clock_tick(i: discord.Interaction):
+        # tick() can open, lock and post several evenings: minutes, not milliseconds
+        await i.response.defer(ephemeral=True)
         res = await bot.tick()
-        await i.response.send_message(
-            f"opened={res['opened'] or '—'} locked={res['locked'] or '—'}", ephemeral=True)
+        await ui.reply(i, content=f"opened={res['opened'] or '—'} locked={res['locked'] or '—'}")
 
     @bot.tree.command(name="export", description="Download the season ledger as CSV")
     @app_commands.checks.has_permissions(administrator=True)
@@ -673,10 +693,13 @@ def _setup_status(conn, guild) -> discord.Embed:
         msg = str(err)
         if isinstance(err, app_commands.MissingPermissions) or "requires" in msg.lower():
             msg = "Administrator or **Hub Staff** only."
-        if not i.response.is_done():
-            await i.response.send_message(f"⚠️ {msg}", ephemeral=True)
-        else:
-            await i.followup.send(f"⚠️ {msg}", ephemeral=True)
+        # Was: `followup.send` whenever a response was already "done". On an EXPIRED
+        # interaction that raises NotFound from inside the error handler - which is the
+        # traceback that reached the log instead of an explanation that reached the user.
+        if isinstance(err, discord.NotFound) or isinstance(err.__cause__, discord.NotFound):
+            msg = ("my reply could not be delivered (the command timed out while I was "
+                   "working). Nothing was changed - try again.")
+        await ui.reply(i, content=f"⚠️ {msg}")
 
 
 SETUP_NOTES = """

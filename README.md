@@ -271,7 +271,26 @@ If you would rather pin the command explicitly than rely on autodetection, eithe
 reads that file and ignores `railway.json` for this purpose. `railway.json` still carries
 `numReplicas: 1` and the restart policy, which do still apply.
 
-### If the build fails
+### Interaction expiry, and why the slow commands say "Thinking…"
+
+A slash command is only answerable for **3 seconds**. Past that — or if the gateway reconnects
+in between, which the log shows as a second `logging in using static token` — the token is gone
+and *every* way of answering raises `404 Unknown interaction`, including from inside the error
+handler that was supposed to explain it. That is exactly how `/setup` failed on the first live
+run: the traceback in the log was the error handler itself dying.
+
+Two rules follow, both asserted in `tests/test_deploy.py`:
+
+1. **Acknowledge first, work second.** `/setup`, `/setup-panel` and `/clock-tick` call
+   `i.response.defer(ephemeral=True)` before touching the database, so a slow round trip to
+   Supabase cannot cost the answer. Buttons and selects are exempt — they are already answers.
+2. **Never let a reply raise.** All of them go through `ui.reply(i, ...)`, which picks the one
+   method that is legal for the interaction's current state (`is_done()` → `edit_original_response`,
+   otherwise `send_message`) and swallows only `NotFound`/4xx — anything else still propagates, so
+   a genuine bug is not mistaken for a lost race. `SETUP_NOTES` says "enable Members intent":
+   that one *is* required, unlike Message Content.
+
+
 
 | log line | cause | fix |
 | `✖ No start command detected` + `railpack prepare exited with an error` | Railway now builds with **Railpack 0.39**, not Nixpacks. Railpack does **not** read `railway.json`'s `deploy.startCommand`; it autodetects, and there was no `main.py`/`app.py` in the repo root | fixed by the root `main.py` shim (below). Verify with `railpack prepare . --error-missing-start`, or pin Settings → Deploy → Start Command in the dashboard |
@@ -283,6 +302,7 @@ reads that file and ignores `railway.json` for this purpose. `railway.json` stil
 | `prepared statement "_pg3_0" already exists` | `prepare_threshold` was set to `0`, which means *prepare everything* | keep it `None` in **both** connect sites in `bot/db.py`; there is nothing to clear on Supabase — the statements die with the pooler's server connections |
 | `NameError: name '_SetupAskView' is not defined` inside `setup_hook` | a persistent view defined inside `build_tree()`, referenced at module scope before that function ever runs | fixed by moving the class to module scope; `test_deploy.py` now calls `setup_hook` against a stand-in, because this only ever fired on a real gateway login |
 | `FATAL: (ENOTFOUND) tenant/user postgres.<ref> not found` | project ref or pooler user wrong | the user must stay `postgres.<ref>` while Connection Pooling is on; drop the `.ref` only if you turn pooling off and use port 5432 |
+| `404 Not Found (error code: 10062): Unknown interaction` on `/setup`, with a traceback from the error handler | the reply was sent after the interaction's 3-second window, or the gateway reconnected in between (look for a second `logging in using static token` nearby in the log) | fixed: the slow commands now `defer()` first and every answer goes through `ui.reply`, which cannot raise. Just run `/setup` again — nothing was created |
 | `invalid sslmode value: "true"` | Supabase's JSON field `ssl` pasted into a conninfo string | `db.py` maps it now; or paste the URI, which says `sslmode=require` |
 
 The middle row is the only build risk I could not eliminate from here: I verified the Python the suite

@@ -1,5 +1,26 @@
 # Build status — v4.0 refactor
 
+## 2026-09-09 (latest) — bot is LIVE on Discord; `/setup` was answerable too late
+
+`registered 11 persistent views` … `Shard ID None has connected to Gateway` …
+`logged in as 🏆 Mech Arena | Tournament Hub#4457 (1541282042128367626)`. The build and the
+database work; the remaining failure was on Discord's side of the fence:
+
+`discord.errors.NotFound: 404 (error code: 10062): Unknown interaction` from `/setup`, and the
+traceback was raised **by the error handler** (`tree.error` → `followup.send` on a dead token),
+which is why nothing was shown to the user. Three `logging in using static token` lines in three
+minutes says the gateway session was bouncing, and a bounce between command and answer kills the
+interaction token outright.
+
+Fixed in two layers: the three handlers that do real work before answering (`/setup`,
+`/setup-panel`, `/clock-tick`) now `defer()` first, and every reply is routed through one
+`ui.reply()` that cannot raise. `setup_error` converts an expired interaction into a sentence
+instead of a stack. `test_deploy.py` grew a state-machine fake (fresh / deferred / answered /
+expired / forbidden) because the previous `FakeInteraction` had no way to represent a dead token —
+that is why 72 unguarded reply sites all looked healthy — plus a source check that those three
+handlers defer, and `_SetupAskView` got an `on_error` so an abandoned picker fails visibly.
+Negative control verified: stripping the guard makes the expired case raise `NotFound` again.
+
 ## 2026-09-09 (later) — the *build* broke too: Railway changed builders to Railpack
 
 The next deploy never started a container at all: `using build driver railpack-v0.39.0` …

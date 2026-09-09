@@ -1,8 +1,9 @@
 #!/usr/bin/env python3
-"""Everything a `HUB_DB` paste can contain, plus the two boot paths that only fire on a
-real deploy. This suite exists because the first live Railway deploy crash-looped on an
-`invalid connection option "database"` and then on a `NameError` - and neither was
-reachable from a fake.
+"""Everything that only goes wrong on a real deploy. This suite exists because the first
+live run crash-looped on `invalid connection option "database"`, then on a `NameError`,
+then answered a slash command with `404 Unknown interaction` - and none of the three was
+reachable from a fake: a conninfo parser needs psycopg, `setup_hook` needs to run at all,
+and an expired token needs a state machine the older test double did not have.
 
 Run standalone (SQLite) or under HUB_TEST_DB for the Postgres-only checks:
     python3 tests/test_deploy.py
@@ -16,6 +17,11 @@ import sys
 ROOT = pathlib.Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT / "bot"))
 sys.path.insert(0, str(ROOT / "tests"))
+
+# module level, not inside main(): the fakes below raise and catch these by *type*, and
+# a name only visible in another function's locals would not do that.
+import discord    # noqa: E402  (needs the path insert above)
+import ui         # noqa: E402
 
 ok = fails = 0
 
@@ -203,6 +209,44 @@ def main() -> int:
     else:
         print("      (railpack binary not installed - builder plan check skipped)")
 
+    # -------------------------------------------------- interaction expiry (a live failure)
+    # The first real deploy answered /setup with `404 Unknown interaction` and dumped a
+    # traceback: the gateway reconnected mid-command, the token died, and the error
+    # handler that was supposed to explain it raised NotFound itself. The old fake could
+    # not represent an expired token, so 72 reply sites all looked fine.
+    import asyncio
+    import discord
+    import ui
+    for state in ("fresh", "deferred", "answered", "expired", "forbidden"):
+        fi = _FakeInteraction(state)
+        try:
+            res = asyncio.run(ui.reply(fi, content="x"))
+            err = None
+        except Exception as e:
+            res, err = None, e
+        check(f"ui.reply survives a {state:9} interaction",
+              err is None and res == ("replied" if state != "expired" else "dropped"),
+              f"result={res} err={err!r}")
+    check("ui.reply never leaves a user unanswered silently",
+          ui.reply.__doc__ is not None and "is_done" in ui.reply.__doc__)
+
+    # Every handler that does real work must acknowledge FIRST. Deferring is what keeps
+    # the token alive across a Supabase round trip; this is a source check because the
+    # race is timing, not logic, and no fake can lose it for us.
+    import re as _re
+    src = (ROOT / "bot" / "main.py").read_text()
+    for fn in ("async def setup(i", "async def setup_panel(", "async def clock_tick("):
+        i0 = src.index(fn)
+        body = src[i0:src.index("\n    @", i0 + 10)]
+        first = _re.search(r"await i\.response\.(defer|send_message)", body)
+        check(f"{fn.split()[2].rstrip('(')} defers before it responds",
+              first is not None and first.group(1) == "defer",
+              first.group(0) if first else "no response call found")
+    check("no error handler replies raw any more",
+          "await i.response.send_message" not in src[src.index("@setup.error"):
+                                                     src.index("@setup.error") + 1400],
+          "found a raw send_message in setup_error")
+
     # ------------------------------------------------------------ only with a live server
     url = (sys.argv[1] if len(sys.argv) > 1 else "") or ""
     if url.startswith("postgres"):
@@ -293,6 +337,71 @@ def _run_with_fake(fake, D):
             sys.modules["psycopg"] = saved
         else:
             sys.modules.pop("psycopg", None)
+
+
+
+def _discord_error(cls):
+    """A genuine discord.NotFound / Forbidden, without aiohttp's response plumbing.
+
+    The CLASS must be real - ui.reply catches `discord.NotFound` by type, so a
+    lookalike would sail straight past the very branch under test. Only the
+    constructor is skipped, because building one needs a live ClientResponse, which
+    would couple this file to an aiohttp version the bot does not even depend on.
+    """
+    import discord
+    e = cls.__new__(cls)
+    e.status = 404 if cls is discord.NotFound else 403
+    e.code = 10062 if cls is discord.NotFound else 50013
+    e.message = "Unknown interaction" if cls is discord.NotFound else "Missing Access"
+    e.text = '{"code": %d, "message": "%s"}' % (e.code, e.message)
+    e.response = None
+    return e
+
+
+class _FakeResp:
+    """Mirrors InteractionResponse. `is_done` is a METHOD (the real one is a property-like
+    function, not a property), and a deferred reply already counts as done - which is the
+    whole reason the old code's `else: followup.send(...)` branch existed."""
+
+    def __init__(self, state):
+        self.state = state
+        self.sent = []
+        self.deferred = state in ("deferred", "answered", "expired", "forbidden")
+        if state == "answered":
+            self.sent = [{}]
+
+    def is_done(self):
+        return self.deferred or bool(self.sent)
+
+    async def defer(self, **kw):
+        if self.state == "expired":
+            raise _discord_error(discord.NotFound)
+        self.deferred = True
+
+    async def send_message(self, **kw):
+        if self.state == "expired":
+            raise _discord_error(discord.NotFound)
+        if self.state == "forbidden":
+            raise _discord_error(discord.Forbidden)
+        self.sent.append(kw)
+
+
+class _FakeInteraction:
+    """state in: fresh | deferred | answered | expired | forbidden
+
+    `expired` reproduces the deployed failure exactly: the token is gone, so *every*
+    way of answering raises the NotFound Discord returned at 08:31:05.
+    """
+
+    def __init__(self, state):
+        self.response = _FakeResp(state)
+        self.edits = []
+        self.user = None
+
+    async def edit_original_response(self, **kw):
+        if self.response.state == "expired":
+            raise _discord_error(discord.NotFound)
+        self.edits.append(kw)
 
 
 def _prepared_after_repeats(url, threshold):
