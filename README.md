@@ -110,8 +110,8 @@ The two things that must be pinned are pinned by plain text files instead:
 One **worker** service, no web server, `restartPolicyType: ALWAYS`, `numReplicas: 1`.
 
 ```
-variables:  HUB_TOKEN   (Secret)
-            HUB_DB      /data/hub.db
+variables:  HUB_TOKEN   (Secret)  bot token
+            HUB_DB      postgres://...  ← Supabase (recommended),  OR  /data/hub.db + a Volume
             HUB_GUILD   your server id  → instant command sync (global sync can take an hour)
             PYTHONUNBUFFERED  1     (optional for Python, it flushes anyway)
 ```
@@ -133,9 +133,69 @@ COPY . .
 CMD ["python", "bot/main.py"]
 ```
 
-**You must add a Volume and mount it at `/data`.** Railway wipes the container filesystem on every
-deploy, so a DB outside the volume means the season is silently erased at your next push.
-`python bot/main.py --check` prints a warning when the DB is not on `/data`.
+### Database: Supabase (recommended) or a Railway volume
+
+Two backends, one code path. `HUB_DB` decides: a `postgres://` URL means Supabase/Postgres,
+anything else is a SQLite file. `db.connect()` is the only place that knows the difference — the
+144 queries in `bot/` never mention a driver.
+
+**Supabase** is the better default because it removes the failure mode entirely. A SQLite file on
+Railway survives only if you mount a Volume at `/data` *and* never recreate that service; get it
+wrong and nothing errors — the season just quietly resets to empty on the next deploy.
+
+Set it up like this:
+
+1. Supabase → new project. **Settings → Database → Connection pooling → enable** (PgBouncer).
+2. Copy **Connection string → URI → `Session` or `Transaction` pooler**, not the direct
+   connection: Railway has no fixed egress IP, so the direct 5432 port is unreachable for it.
+3. **Settings → Database → IPv4 — turn OFF the "enforce IP restrictions"** toggle, or every
+   deploy connection is refused from an IP you cannot allowlist.
+4. Railway → Variables → `HUB_DB` = that URL, **as a Secret**. Keep it out of git: that URL alone
+   lets anyone rewrite a season.
+5. Deploy, then run `/setup` again if you are moving an existing season (see below).
+
+Use the pooler **port 6543** (`aws-0-<region>.pooler.supabase.com`) and keep `sslmode=require`.
+`psycopg` is pinned in `requirements.txt` with `prepare_threshold=0` (client-side binds) — that
+is what makes transaction pooling work; server-side prepared statements leak between pooled
+clients and die with `prepared statement "..." already exists`.
+
+**Moving an existing season off SQLite:** run `python3 tools/sqlite2pg.py hub.db "postgres://…"`
+**from your own machine** (it needs to reach both the old file and the new server; `tools/` is not
+in the deploy image). It is idempotent — re-running after a few more nights copies the new rows and
+supersedes the old ones rather than duplicating them — and it refuses to report success unless every
+table's row count matches the source.
+It copies rows, then re-aligns every `id` sequence, which is the step that gets forgotten and
+bites later: Postgres sequences do not follow explicitly-inserted ids, so the next `INSERT`
+without an id collides with a row that already exists — during a grading run, days from now.
+
+**If you would rather stay on SQLite:** then yes, **add a Volume and mount it at `/data`**, and
+set `HUB_DB=/data/hub.db`. `python bot/main.py --check` prints a warning when the DB is not on a
+volume and a confirmation line when it is Postgres, so `--check` output tells you which backend
+you are actually on:
+
+```
+db : postgres://xxx.pooler.supabase.com:6543/postgres (postgres)
+     ✓ hosted Postgres: survives redeploys without a volume. …
+```
+
+### Why the Postgres path is not just `sqlite3` renamed
+
+The two engines disagree in ways that a mock cannot show, so all four suites plus a new parity
+suite were run against a real PostgreSQL 17 server (`HUB_TEST_DB=postgres://… python3
+run_tests.py`). What had to be handled, each found by running it:
+
+| difference | consequence if ignored |
+|---|---|
+| `INTEGER PRIMARY KEY` is the rowid in SQLite, plain int in Postgres | every id-less insert fails `null value in column "id"` |
+| any error aborts the whole transaction in Postgres, not in SQLite | a player's duplicate submission poisons the `with conn:` block around it → `InFailedSqlTransaction` |
+| `psycopg.IntegrityError` ≠ `errors.IntegrityConstraintViolation` | `except IntegrityError` misses UNIQUE violations → dead button, lost answer |
+| `HAVING nights` (a SELECT alias) is legal SQLite, illegal Postgres | the leaderboard query 500s |
+| SQLite's `INSERT OR REPLACE` deletes then inserts, so unlisted columns revert to DEFAULT | a re-grade would keep last run's `coins`/`applied_by` and print wrong totals |
+| psycopg scans `%` for placeholders whenever a params object is passed | `LIKE 'role.%'` and any prompt containing `%` become syntax errors |
+
+`tests/test_pg_parity.py` runs one full season on both backends and asserts the ledger rows,
+award totals, leaderboard order, audit size and payout total are **identical**, then closes the
+socket to prove the reconnect works.
 
 ### If the build fails
 

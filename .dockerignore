@@ -16,6 +16,8 @@ __pycache__/
 *.env
 sim/
 tests/
+tools/
+.mig_src.db
 run_tests.py
 Dockerfile
 .dockerignore

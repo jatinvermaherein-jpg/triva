@@ -43,6 +43,20 @@ Last run: `python3 run_tests.py` → **all 5 suites green, 287 checks**
   **deleted** after it failed the first deploy (see README); Python is pinned by `runtime.txt`
   and `.python-version`, and `requirements.txt` is now exact and was test-verified from a clean venv.
 - Docs rewritten for the rotation: plan, announcement, ops, README.
+- **Postgres / Supabase backend** (`main`, this round) — `db.connect()` now speaks to either
+  engine and nothing else knows the difference. `HUB_DB=postgres://…` selects Postgres; a file
+  path still selects SQLite+WAL. The facade in `bot/db.py` translates `?`→`%s` (quote-aware),
+  `INSERT OR REPLACE/IGNORE`, `with conn:` (23 sites) → BEGIN/COMMIT/ROLLBACK with savepoints so
+  a caught UNIQUE violation stays survivable, identity `id` columns, bind-time bool/float
+  coercion, and `sqlite3.IntegrityError`-compatible error names. `requirements.txt` gains
+  `psycopg[binary]==3.2.10` with `prepare_threshold=0` for PgBouncer transaction pooling.
+  `tools/sqlite2pg.py` migrates a live season and re-aligns sequences; verified value-for-value.
+- **Verification, not assumption** — all four suites plus a new `tests/test_pg_parity.py` were
+  run against a real PostgreSQL 17 server (`HUB_TEST_DB=postgres://…`): 49 · 171 · 108 · 75 · 14 ·
+  refs green on **both** backends. Six dialect bugs were found only by running it (identity ids,
+  aborted-transaction poisoning, psycopg's IntegrityError taxonomy, HAVING aliases, REPLACE
+  revert-to-DEFAULT, and `%` in `LIKE`) — each is in the README table. `run.sh` installs both drivers.
+
 
 ### Bugs this round caught by running things
 - `grade_question` filtered `entry.status`, a column that never existed — masked by

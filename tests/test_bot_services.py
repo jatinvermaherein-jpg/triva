@@ -11,16 +11,21 @@ import time
 
 ROOT = pathlib.Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT / "bot"))
+sys.path.insert(0, str(ROOT / "tests"))
+import dbtarget
 import db as D            # noqa: E402
 import services as V      # noqa: E402
 
 def _fresh(path):
-    """Delete a DB AND its sidecar files.
+    """Delete a DB AND its sidecar files (or reset the schema, on Postgres).
 
     WAL/journal siblings survive deleting the main file and silently re-apply the
     OLD schema - which is how "the code is fine but the test fails" happens, both
     here and on any server where someone rm's hub.db but not hub.db-wal.
     """
+    alt = dbtarget.fresh(path)          # HUB_TEST_DB=postgres://... re-points the suite
+    if alt:
+        return alt
     path = pathlib.Path(path)
     for suffix in ("", "-wal", "-shm", "-journal"):
         p = pathlib.Path(str(path) + suffix)
@@ -39,7 +44,8 @@ def check(name, cond, detail=""):
     print(f"pass  {name}")
 
 tmp = _fresh(ROOT / ".pytest_tmp" / "hub_test.db")
-tmp.parent.mkdir(parents=True, exist_ok=True)
+if not D.is_pg_target(tmp):                    # a URL has no parent dir to make
+    tmp.parent.mkdir(parents=True, exist_ok=True)
 conn = D.connect(tmp)
 # Most of this file asserts on tiny fixtures (1-3 nights), so the production
 # 5-night podium floor is turned OFF here and tested separately below.
@@ -625,7 +631,8 @@ check("solo is structural: a submission row is keyed to the player who pressed t
 def _champion_db(path_name):
     """One graded night => one league champion, in a fresh DB."""
     pp = _fresh(ROOT / ".pytest_tmp" / path_name)
-    pp.parent.mkdir(parents=True, exist_ok=True)
+    if not D.is_pg_target(pp):                     # ditto, for the champion fixtures
+        pp.parent.mkdir(parents=True, exist_ok=True)
     cc = D.connect(pp)
     D.set_cfg(cc, "standings_night_floor", 0)     # 1-night fixture vs a 5-night floor
     V.create_season(cc, "Season 1", "2026-09-14", weeks=1)

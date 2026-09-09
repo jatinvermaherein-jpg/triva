@@ -6,18 +6,23 @@ import sys
 
 ROOT = pathlib.Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT / "bot"))
+sys.path.insert(0, str(ROOT / "tests"))
+import dbtarget
 import discord
 import db as D
 import services as V
 import ui
 
 def _fresh(path):
-    """Delete a DB AND its sidecar files.
+    """Delete a DB AND its sidecar files (or reset the schema, on Postgres).
 
     WAL/journal siblings survive deleting the main file and silently re-apply the
     OLD schema - which is how "the code is fine but the test fails" happens, both
     here and on any server where someone rm's hub.db but not hub.db-wal.
     """
+    alt = dbtarget.fresh(path)          # HUB_TEST_DB=postgres://... re-points the suite
+    if alt:
+        return alt
     path = pathlib.Path(path)
     for suffix in ("", "-wal", "-shm", "-journal"):
         p = pathlib.Path(str(path) + suffix)
@@ -63,12 +68,16 @@ class FakeUser:
 
 # --- build a bot-shaped object without a token --------------------------- #
 import main as M
-DB = ROOT / ".pytest_tmp" / "sched.db"
-DB.parent.mkdir(exist_ok=True)
-for suffix in ("", "-wal", "-shm", "-journal"):     # a stale -wal resurrects old rows
-    path = pathlib.Path(str(DB) + suffix)
-    if path.exists():
-        path.unlink()
+# Must go through _fresh() like every other fixture here: hard-coding the file path meant this
+# suite kept opening a SQLite file even when HUB_TEST_DB pointed at Postgres, so its 75 checks
+# were quietly testing the wrong backend while still printing "pass".
+DB = _fresh(ROOT / ".pytest_tmp" / "sched.db")
+if not D.is_pg_target(DB):
+    pathlib.Path(DB).parent.mkdir(exist_ok=True)
+    for suffix in ("", "-wal", "-shm", "-journal"):  # a stale -wal resurrects old rows
+        path = pathlib.Path(str(DB) + suffix)
+        if path.exists():
+            path.unlink()
 conn = D.connect(DB)
 
 bot = M.HubBot.__new__(M.HubBot)          # no gateway needed for tick()/post_evening()

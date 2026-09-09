@@ -4,3 +4,8 @@
 # written against this version's behaviour. Bump deliberately, with a test run, never
 # as a side effect of a rebuild.
 discord.py==2.7.1
+
+# Supabase / any Postgres. Only imported when HUB_DB is a postgres:// URL, so a SQLite install
+# never needs it - but Railway does, or connect() dies with ModuleNotFoundError at boot.
+# prepare_threshold=0 (client-side binds) is what makes this safe behind Supabase's PgBouncer.
+psycopg[binary]==3.2.10

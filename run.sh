@@ -7,7 +7,7 @@ if [ ! -f .venv/bin/activate ]; then
   echo "→ creating venv"
   python3 -m venv .venv
   .venv/bin/pip install -q --upgrade pip
-  .venv/bin/pip install -q -r requirements.txt
+  .venv/bin/pip install -q -r requirements.txt   # pulls discord.py + psycopg
 fi
 # shellcheck disable=SC1091
 . .venv/bin/activate

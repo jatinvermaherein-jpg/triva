@@ -13,18 +13,23 @@ import sys
 
 ROOT = pathlib.Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT / "bot"))
+sys.path.insert(0, str(ROOT / "tests"))
+import dbtarget
 import db as D                 # noqa: E402
 import services as V          # noqa: E402
 import ui                     # noqa: E402
 import discord                # noqa: E402
 
 def _fresh(path):
-    """Delete a DB AND its sidecar files.
+    """Delete a DB AND its sidecar files (or reset the schema, on Postgres).
 
     WAL/journal siblings survive deleting the main file and silently re-apply the
     OLD schema - which is how "the code is fine but the test fails" happens, both
     here and on any server where someone rm's hub.db but not hub.db-wal.
     """
+    alt = dbtarget.fresh(path)          # HUB_TEST_DB=postgres://... re-points the suite
+    if alt:
+        return alt
     path = pathlib.Path(path)
     for suffix in ("", "-wal", "-shm", "-journal"):
         p = pathlib.Path(str(path) + suffix)
@@ -111,7 +116,8 @@ check("no generated custom_ids anywhere",
 
 # --- 2. layout limits ------------------------------------------------------ #
 tmp = _fresh(ROOT / ".pytest_tmp" / "ui.db")
-tmp.parent.mkdir(parents=True, exist_ok=True)
+if not D.is_pg_target(tmp):                    # a URL has no parent dir to make
+    tmp.parent.mkdir(parents=True, exist_ok=True)
 conn = D.connect(tmp)
 V.create_season(conn, "S1", "2026-09-14", weeks=1)
 ev = conn.execute("SELECT * FROM evening WHERE league='l1' AND day='2026-09-14'").fetchone()

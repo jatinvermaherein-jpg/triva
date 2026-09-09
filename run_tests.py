@@ -2,7 +2,12 @@
 """Run every check. Exits non-zero if anything fails, so this is CI-ready.
 
 Usage:  python3 run_tests.py
-Takes ~3 seconds and needs no Discord token, no network and no guild.
+        HUB_TEST_DB=postgres://user:pw@host/db python3 run_tests.py   # same suites on Postgres
+
+Takes a few seconds and needs no Discord token, no network and no guild. Against a real
+Postgres server it additionally proves the Supabase adapter: the parity suite's 14th check
+(dropped-connection recovery) only runs when a live server is reachable, and says so rather
+than quietly counting itself as a pass.
 """
 import pathlib
 import subprocess
@@ -14,6 +19,7 @@ SUITES = [
     ("service layer", "tests/test_bot_services.py"),
     ("button UI + permissions", "tests/test_bot_ui.py"),
     ("scheduler + outage recovery", "tests/test_bot_scheduler.py"),
+    ("backend parity (sqlite vs postgres)", "tests/test_pg_parity.py"),
     ("cross-module references", "tests/test_symbols.py"),
 ]
 

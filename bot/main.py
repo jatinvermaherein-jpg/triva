@@ -714,7 +714,9 @@ def main() -> int:
         # On Railway the persistent volume is mounted at /data; a DB written to
         # the build directory is deleted on every redeploy, which silently wipes
         # the season. Respect an explicit HUB_DB first, then /data, then CWD.
-        env = os.environ.get("HUB_DB")
+        # HUB_DB may instead be a postgres:// URL (Supabase), which is the case that
+        # needs no volume at all - so it is returned verbatim and never given a fallback.
+        env = (os.environ.get("HUB_DB") or "").strip()
         if env:
             return env
         return "/data/hub.db" if os.path.isdir("/data") else "hub.db"
@@ -729,17 +731,29 @@ def main() -> int:
         print(SETUP_NOTES)
         return 0
     token = os.environ.get("HUB_TOKEN", "").strip()
-    conn = D.connect(pathlib.Path(args.db))
+    # sqlite takes a Path; a postgres URL must stay a str, because pathlib collapses
+    # "postgres://" to "postgres:/" and the URL would then be treated as a filename.
+    target = (args.db if D.is_pg_target(args.db) else pathlib.Path(args.db))
+    conn = D.connect(target)
     bot = HubBot(conn)
     build_tree(bot)
     if args.check:
+        is_pg = D.is_pg_target(args.db)
         on_volume = str(args.db).startswith("/data/")
-        print(f"db            : {args.db} (sqlite, WAL)"
-              + ("" if on_volume else "  ⚠️ NOT on a volume"))
-        if not on_volume:
+        print(f"db            : {args.db}"
+              + (" (postgres)" if is_pg else " (sqlite, WAL)")
+              + ("" if (is_pg or on_volume) else "  ⚠️ NOT on a volume"))
+        if is_pg:
+            # The whole point of the Postgres move: persistence is the server's job, so the
+            # volume warning would be noise - and a false "you are safe" would be worse. Say
+            # what actually protects the data here instead.
+            print("                ✓ hosted Postgres: survives redeploys without a volume. "
+                  "Keep HUB_DB out of git;\n                  the URL is the only credential "
+                  "needed to rewrite a season, so use the pooler + a strong password.")
+        elif not on_volume:
             print("                ⚠ Railway wipes the container filesystem on every "
                   "redeploy.\n                  Mount a volume at /data and set "
-                  "HUB_DB=/data/hub.db or the season is lost on deploy.")
+                  "HUB_DB=/data/hub.db, or point HUB_DB at a postgres:// URL.")
         print(f"persistent views: {len(ui.PERSISTENT_VIEWS)} registered for restart-proof dispatch")
         print(f"seasons       : {conn.execute('SELECT COUNT(*) c FROM season').fetchone()['c']}")
         print(f"token set     : {bool(token)}")

@@ -15,7 +15,6 @@ from __future__ import annotations
 import datetime as dt
 import json
 import pathlib
-import sqlite3
 import sys
 
 import discord
@@ -711,7 +710,11 @@ def submit_answer(conn, question_id: int, player_id: int, option_idx: int | None
                 "INSERT INTO entry(evening_id,question_id,player_id,payload,option_idx,"
                 "submitted_at) VALUES(?,?,?,?,?,?)",
                 (q["evening_id"], question_id, player_id, text, option_idx, now_ts))
-        except sqlite3.IntegrityError:
+        except dbmod.sqlite3.IntegrityError:
+            # Catching sqlite3's class via the loader seam covers both backends: db.py's
+            # Postgres adapter raises db.IntegrityError, which SUBCLASSES this one, so a
+            # duplicate submission is an edit here and not a dead button. (Catching
+            # db.IntegrityError instead would miss the SQLite backend entirely.)
             # UNIQUE(question_id, player_id): the player is changing their mind.
             # Editing while OPEN is allowed and free (fixing a typo is not cheating).
             prev = conn.execute("SELECT * FROM entry WHERE question_id=? AND player_id=?",
@@ -1136,7 +1139,8 @@ def standings(conn, scope: str = "league", season: int | None = None,
     rows = conn.execute(
         f"SELECT l.player_id, SUM(l.points) AS points, COUNT(DISTINCT l.evening_id) AS nights, "
         f"MAX(l.points) AS best_evening FROM ledger l WHERE {' AND '.join(where)} "
-        f"GROUP BY l.player_id HAVING nights >= ? ORDER BY points DESC, best_evening DESC, "
+        f"GROUP BY l.player_id HAVING COUNT(DISTINCT l.evening_id) >= ? "
+        f"ORDER BY points DESC, best_evening DESC, "
         f"nights DESC, l.player_id ASC LIMIT ?", (*params, floor, limit)).fetchall()
     return [dict(r) | {"rank": i + 1} for i, r in enumerate(rows)]
 
