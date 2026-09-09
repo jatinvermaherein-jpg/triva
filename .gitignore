@@ -1,0 +1,23 @@
+# The season lives in the database. It is server state, never source: committing
+# it would publish player ids, submissions and the audit trail, and every deploy
+# would fight over it.
+*.db
+*.db-wal
+*.db-shm
+*.db-journal
+*.sqlite
+*.sqlite3
+
+__pycache__/
+*.pyc
+.pytest_cache/
+.venv/
+venv/
+.mypy_cache/
+.ruff_cache/
+.DS_Store
+
+# local-only secrets, in case someone runs the bot from a checkout
+.env
+.env.*
+*.token
