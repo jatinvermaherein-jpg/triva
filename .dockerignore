@@ -22,4 +22,6 @@ Dockerfile
 README.md
 STATUS.md
 0*.md
-# Deliberately NOT ignored: bot/ engine/ requirements.txt railway.json nixpacks.toml
+# Deliberately NOT ignored: bot/ engine/ requirements.txt railway.json runtime.txt
+# .python-version  (the two version pins must reach the builder, or it defaults to
+# an ancient Python and the bot dies on `from zoneinfo import ZoneInfo`).

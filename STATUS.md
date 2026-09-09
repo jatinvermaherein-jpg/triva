@@ -38,8 +38,10 @@ Last run: `python3 run_tests.py` → **all 5 suites green, 287 checks**
   the reason; re-grades a night that has already been scored.
 - **No AI, solo** — `HONESTY_NOTE` on the card and modal, `flag_submission` records a
   human judgement on `submission.flag` (migration added). No classifier anywhere.
-- **Railway** — `railway.json`, `nixpacks.toml`, `.dockerignore` (NOT .railwayignore,
-  which is undocumented), `HUB_GUILD` instant sync, `--check` warns if the DB is off `/data`.
+- **Railway** — `railway.json`, `.dockerignore` (NOT .railwayignore, which is undocumented),
+  `HUB_GUILD` instant sync, `--check` warns if the DB is off `/data`. `nixpacks.toml` was
+  **deleted** after it failed the first deploy (see README); Python is pinned by `runtime.txt`
+  and `.python-version`, and `requirements.txt` is now exact and was test-verified from a clean venv.
 - Docs rewritten for the rotation: plan, announcement, ops, README.
 
 ### Bugs this round caught by running things

@@ -91,14 +91,46 @@ where the second key silently deletes the first.
 
 ## Deploying (Railway)
 
-`railway.json` + `nixpacks.toml` + `requirements.txt` are in the repo. One **worker** service, no
-web server, `restartPolicyType: ALWAYS`, Python 3.13 via Nixpacks.
+There is deliberately **no `nixpacks.toml`**. An earlier one broke the very first deploy: it carried
+`providers = { python = "3.13" }` and a `schemaVersion` key, neither of which exists in Nixpacks'
+config schema, so Nixpacks 1.41 died during `prepare` with
+`invalid type: map, expected a sequence for key 'providers'` — before a single package was
+installed. Every option in that file was already covered by `railway.json` or by Railway's defaults,
+so it bought nothing and cost a deploy. Now Railway/Nixpacks runs on autodetection, which cannot
+fail to parse.
+
+The two things that must be pinned are pinned by plain text files instead:
+
+- `runtime.txt` → `python-3.13`, and `.python-version` → `3.13`. Both are read by Nixpacks' Python
+  provider; either alone is enough, they agree so there is no "which wins" question. **Without one of
+  these you get Python 3.8 and the bot dies on `from zoneinfo import ZoneInfo`.**
+- `requirements.txt` is exact (`discord.py==2.7.1`), and the full suite was run against a venv
+  created from that file, so the deploy host resolves exactly what was tested. No `pip freeze` needed.
+
+One **worker** service, no web server, `restartPolicyType: ALWAYS`, `numReplicas: 1`.
 
 ```
 variables:  HUB_TOKEN   (Secret)
             HUB_DB      /data/hub.db
             HUB_GUILD   your server id  → instant command sync (global sync can take an hour)
-            PYTHONUNBUFFERED  1
+            PYTHONUNBUFFERED  1     (optional for Python, it flushes anyway)
+```
+
+These three are the complete list — `grep` over `bot/` finds exactly three `os.environ.get` calls
+(`HUB_TOKEN`, `HUB_DB`, `HUB_GUILD`); `HUB_ROLE` in `bot/ui.py` is a constant, not config. If Railway
+ever needs the version overridden at build time rather than by the file, the documented variable is
+`NIXPACKS_PYTHON_VERSION=3.13`.
+
+**If a build fails again and you want to stop iterating on Railway's autodetection**, flip the
+service's *Builder* to **Dockerfile** and commit this — it removes Nixpacks from the loop entirely:
+
+```dockerfile
+FROM python:3.13-slim
+WORKDIR /app
+COPY requirements.txt .
+RUN pip install --no-cache-dir -r requirements.txt
+COPY . .
+CMD ["python", "bot/main.py"]
 ```
 
 **You must add a Volume and mount it at `/data`.** Railway wipes the container filesystem on every

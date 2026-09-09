@@ -1,1 +1,6 @@
-discord.py>=2.4,<3.0
+# Pinned to exactly what the whole test suite was run against (Python 3.13.14).
+# An unpinned range let the resolver pick a newer minor on the deploy host than the
+# one the UI contracts were validated on - the button/layout limits in bot/ui.py are
+# written against this version's behaviour. Bump deliberately, with a test run, never
+# as a side effect of a rebuild.
+discord.py==2.7.1
