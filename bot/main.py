@@ -402,15 +402,71 @@ LEAGUE_CHOICES = [app_commands.Choice(name="📚 League 1 — Knowledge", value=
                   app_commands.Choice(name="🔧 League 3 — Hangar", value="l3")]
 
 
+def _missing_perms(channel, **needed: bool) -> str:
+    """Human-readable list of what the BOT lacks in `channel`, or "" if it is fine.
+
+    Discord's 403 is `50001: Missing Access` for both "I cannot see this channel" and "I
+    cannot post here", and the traceback names neither the channel nor the permission - so
+    the operator is told only that something is forbidden, by a stack trace, after the
+    config has already been written. Asking `permissions_for` first turns that into a
+    sentence naming the exact toggle.
+
+    Returns "" when the check cannot be made (a DM, an uncached guild member); the caller
+    still wraps the send in try/except, so a missed check degrades to the old behaviour
+    rather than blocking a legitimate post.
+    """
+    guild = getattr(channel, "guild", None)
+    me = getattr(guild, "me", None)
+    if me is None or not hasattr(channel, "permissions_for"):
+        return ""
+    try:
+        have = channel.permissions_for(me)
+    except Exception:                                       # noqa: BLE001
+        return ""
+    pretty = {"view_channel": "View Channel", "send_messages": "Send Messages",
+              "embed_links": "Embed Links", "read_message_history": "Read Message History",
+              "manage_channels": "Manage Channels", "manage_roles": "Manage Roles"}
+    lack = [pretty.get(p, p) for p, want in needed.items()
+            if want and not getattr(have, p, False)]
+    return ", ".join(lack)
+
+
 def build_tree(bot: HubBot) -> None:
 
-    @bot.tree.command(description="Post The Hub panel with tonight's leagues")
+    # name= is explicit: without it discord.py derives "setup_panel" from the function,
+    # while every doc and the operator checklist say "/setup-panel". The command existed
+    # under a name nobody was told to type. Hyphen matches the rest of the tree.
+    @bot.tree.command(name="setup-panel",
+                      description="Post The Hub panel with tonight's leagues")
     @app_commands.checks.has_permissions(administrator=True)
     async def setup_panel(i: discord.Interaction, channel: discord.TextChannel):
         await i.response.defer(ephemeral=True)   # posts to another channel before answering
+        # Check BEFORE writing config. The old order stored hub_channel_id, then tried to
+        # post, then raised Forbidden - leaving the bot pointed at a channel it cannot
+        # write to, so the 16:00 scheduler would fail there every night afterwards.
+        missing = _missing_perms(channel, view_channel=True, send_messages=True,
+                                 embed_links=True)
+        if missing:
+            return await ui.reply(
+                i, content=f"⚠️ I cannot post in {channel.mention}: I am missing "
+                           f"**{missing}** there. Nothing was changed. Fix it in that "
+                           f"channel's *Edit Channel → Permissions*, or pick a channel "
+                           f"I can already see, then run this again.")
         D.set_cfg(bot.hub_conn, "hub_channel_id", channel.id)
         e = ui.hub_embed(bot.hub_conn)
-        msg = await channel.send(embed=e, view=ui.HubPanelView(bot.hub_conn))
+        try:
+            msg = await channel.send(embed=e, view=ui.HubPanelView(bot.hub_conn))
+        except discord.Forbidden:
+            # A race, or a permission the overwrite calculation cannot see (a channel in a
+            # category the bot is denied at server level). Roll the pointer back rather
+            # than leave it aimed somewhere unusable.
+            D.set_cfg(bot.hub_conn, "hub_channel_id", bot.hub_channel_id or 0)
+            return await ui.reply(
+                i, content=f"⚠️ Discord refused the post to {channel.mention} "
+                           f"(403 Missing Access) even though my permissions looked "
+                           f"sufficient. Nothing was changed. This is usually a **category** "
+                           f"override above the channel, or the bot's role sitting below a "
+                           f"role that denies View Channel.")
         bot.hub_channel_id = channel.id
         await ui.reply(i, content=f"Pinned panel is live in {channel.mention} "
                                   f"(message {msg.id}).")
@@ -473,44 +529,6 @@ def build_tree(bot: HubBot) -> None:
                            "usual cause and the second try always lands.")
         log.exception("setup failed", exc_info=error)
         await ui.reply(i, content=f"⚠️ Setup failed: `{type(error).__name__}`")
-
-
-def _setup_status(conn, guild) -> discord.Embed:
-    """Re-resolve every stored id and report anything that no longer resolves.
-
-    This is the safety net for the id-based design: if an admin deletes a channel
-    outside the bot, the stored id points at nothing, and the ONLY way to notice is
-    to look. So look.
-    """
-    e = discord.Embed(title="Hub wiring — by Discord id", colour=0x95a5a6)
-    bad, ok = [], []
-    for key, name, staff_only, _slow, why in V.PROVISION_CHANNELS:
-        cid_ = D.cfg(conn, V._hubkey("channel", key))
-        chan = guild.get_channel(cid_) if (cid_ and guild) else None
-        if chan is None:
-            bad.append(f"✖️ **#{name}** — {why}"
-                       + (f" (stored id `{cid_}` is dead)" if cid_ else " (never created)"))
-        else:
-            ok.append(f"✅ **#{chan.name}** — `{chan.id}`"
-                      + (" · renamed from the original, still wired"
-                         if chan.name != name else ""))
-    for key, name, _c, _h in V.PROVISION_ROLES:
-        rid = (D.cfg(conn, "staff_role_id") if key == "staff"
-               else D.cfg(conn, V._hubkey("role", key)))
-        role = guild.get_role(rid) if rid else None
-        if rid and role is None:
-            bad.append(f"✖️ role **{name}** — stored id `{rid}` no longer exists")
-        elif role is not None:
-            ok.append(f"✅ role **{role.name}** — `{role.id}`")
-    desc = "\n".join(ok) or "*nothing is wired yet — run /setup mode:SETUP*"
-    if bad:
-        desc += "\n\n**Broken:**\n" + "\n".join(bad) + \
-            "\n\nFix with `/setup mode:SETUP` (re-adopts or recreates), or " \
-            "`/setup-channel` for one channel."
-    e.description = desc[:4000]
-    e.set_footer(text="Renaming a channel or role is NOT in the broken list on purpose: "
-                      "the bot follows the id, so a new name is cosmetic.")
-    return e
 
 
     @bot.tree.command(name="setup-channel", description="Set where each league posts")
@@ -636,24 +654,41 @@ def _setup_status(conn, guild) -> discord.Embed:
         """Three views on one card: this month, the league tables, lifetime.
         It rewrites itself whenever points move - no refresh button needed."""
         await i.response.defer(ephemeral=True)
-        msg = await i.channel.send(embed=ui.board_embed(bot.hub_conn, "season", None),
-                                   view=ui.BoardView(bot.hub_conn))
+        missing = _missing_perms(i.channel, send_messages=True, embed_links=True)
+        if missing:
+            return await ui.reply(i, content=f"⚠️ I cannot post here: missing "
+                                             f"**{missing}** in this channel.")
+        try:
+            msg = await i.channel.send(embed=ui.board_embed(bot.hub_conn, "season", None),
+                                       view=ui.BoardView(bot.hub_conn))
+        except discord.Forbidden:
+            return await ui.reply(i, content="⚠️ Discord refused the post here "
+                                             "(403 Missing Access). Nothing was pinned.")
         D.set_cfg(bot.hub_conn, f"board:{msg.id}", i.channel.id)
-        await i.followup.send(f"📌 Leaderboard pinned here. It updates itself on every "
-                              f"award and on season rollover.")
+        await ui.reply(i, content="📌 Leaderboard pinned here. It updates itself on every "
+                                  "award and on season rollover.")
 
     @bot.tree.command(name="pin-checkout",
                       description="Pin the pending-checkout queue (staff pay, bot lists)")
     @app_commands.checks.has_permissions(administrator=True)
     async def pin_checkout(i: discord.Interaction):
         await i.response.defer(ephemeral=True)
+        missing = _missing_perms(i.channel, send_messages=True, embed_links=True)
+        if missing:
+            return await ui.reply(i, content=f"⚠️ I cannot post here: missing "
+                                             f"**{missing}** in this channel.")
         rows = V.pending_payouts(bot.hub_conn)
         view = ui.CheckoutView(bot.hub_conn) if rows else ui.no_controls()
-        msg = await i.channel.send(embed=ui.checkout_embed(bot.hub_conn), view=view)
+        try:
+            msg = await i.channel.send(embed=ui.checkout_embed(bot.hub_conn), view=view)
+        except discord.Forbidden:
+            return await ui.reply(i, content="⚠️ Discord refused the post here "
+                                             "(403 Missing Access). Nothing was pinned.")
         D.set_cfg(bot.hub_conn, f"checkout:{msg.id}", i.channel.id)
-        await i.followup.send(
-            f"📌 Checkout queue pinned. {len(rows)} row(s) pending. "
-            "The bot never pays: send the coins in-server, then press the row's button.")
+        await ui.reply(
+            i, content=f"📌 Checkout queue pinned. {len(rows)} row(s) pending. "
+                       "The bot never pays: send the coins in-server, then press the "
+                       "row's button.")
 
     @bot.tree.command(name="queue-payouts",
                       description="Turn this season's standings into pending checkouts")
@@ -701,9 +736,23 @@ def _setup_status(conn, guild) -> discord.Embed:
 
     @bot.tree.error
     async def on_error(i: discord.Interaction, err: app_commands.AppCommandError):
+        # Log first: this handler REPLACES discord.py's default, and the default is the
+        # only thing that was printing these. Without it a command that raises anything
+        # other than the two shapes below is answered politely and vanishes from Railway.
+        log.exception("command %s failed",
+                      getattr(i.command, "name", "?"), exc_info=err)
         msg = str(err)
         if isinstance(err, app_commands.MissingPermissions) or "requires" in msg.lower():
             msg = "Administrator or **Hub Staff** only."
+        cause = getattr(err, "__cause__", None)
+        if isinstance(err, discord.Forbidden) or isinstance(cause, discord.Forbidden):
+            # 50001 is "Missing Access", which Discord uses for both "cannot see it" and
+            # "cannot post in it". The traceback named neither the channel nor the
+            # permission, which is what made the deploy log unreadable.
+            msg = ("I do not have permission to do that in this server. Check that my "
+                   "role has **View Channel**, **Send Messages** and **Embed Links** in "
+                   "the channel involved - and that no *category* override above it "
+                   "denies them.")
         # Was: `followup.send` whenever a response was already "done". On an EXPIRED
         # interaction that raises NotFound from inside the error handler - which is the
         # traceback that reached the log instead of an explanation that reached the user.
@@ -712,6 +761,44 @@ def _setup_status(conn, guild) -> discord.Embed:
                    "working). Nothing was changed - try again.")
         await ui.reply(i, content=f"⚠️ {msg}")
 
+
+
+def _setup_status(conn, guild) -> discord.Embed:
+    """Re-resolve every stored id and report anything that no longer resolves.
+
+    This is the safety net for the id-based design: if an admin deletes a channel
+    outside the bot, the stored id points at nothing, and the ONLY way to notice is
+    to look. So look.
+    """
+    e = discord.Embed(title="Hub wiring — by Discord id", colour=0x95a5a6)
+    bad, ok = [], []
+    for key, name, staff_only, _slow, why in V.PROVISION_CHANNELS:
+        cid_ = D.cfg(conn, V._hubkey("channel", key))
+        chan = guild.get_channel(cid_) if (cid_ and guild) else None
+        if chan is None:
+            bad.append(f"✖️ **#{name}** — {why}"
+                       + (f" (stored id `{cid_}` is dead)" if cid_ else " (never created)"))
+        else:
+            ok.append(f"✅ **#{chan.name}** — `{chan.id}`"
+                      + (" · renamed from the original, still wired"
+                         if chan.name != name else ""))
+    for key, name, _c, _h in V.PROVISION_ROLES:
+        rid = (D.cfg(conn, "staff_role_id") if key == "staff"
+               else D.cfg(conn, V._hubkey("role", key)))
+        role = guild.get_role(rid) if rid else None
+        if rid and role is None:
+            bad.append(f"✖️ role **{name}** — stored id `{rid}` no longer exists")
+        elif role is not None:
+            ok.append(f"✅ role **{role.name}** — `{role.id}`")
+    desc = "\n".join(ok) or "*nothing is wired yet — run /setup mode:SETUP*"
+    if bad:
+        desc += "\n\n**Broken:**\n" + "\n".join(bad) + \
+            "\n\nFix with `/setup mode:SETUP` (re-adopts or recreates), or " \
+            "`/setup-channel` for one channel."
+    e.description = desc[:4000]
+    e.set_footer(text="Renaming a channel or role is NOT in the broken list on purpose: "
+                      "the bot follows the id, so a new name is cosmetic.")
+    return e
 
 SETUP_NOTES = """
 Discord portal checklist (no privileges needed, but you must own the server invite):

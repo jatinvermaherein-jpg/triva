@@ -384,6 +384,40 @@ refused for a passer-by), the confirm view carrying the bypass, discord.py's dro
 behaviour, and `on_error` both logging and replying. The buffering and handler fixes are asserted
 in `tests/test_deploy.py`, which also fails if `/setup` ever regains a `.stop()` call.
 
+### 12 of the 14 commands did not exist, and 338 tests said they did
+
+With the log finally readable, the next deploy showed a `Forbidden` traceback from
+`setup_panel` — and, more revealingly, that `/season-create`, `/question-add` and ten others were
+simply absent from Discord. They were absent from the *bot*: every command from `/setup-channel`
+down was indented one level too deep, landing inside `_setup_status()` **after its `return e`**.
+Unreachable code. `build_tree()` ended 240 lines early, registered two commands, and never reached
+`@bot.tree.error` — so the tree's error handler was the library default the whole time, which is
+why failures arrived as tracebacks that told the operator nothing.
+
+The test suite reported green throughout, and the reason is worth recording: every structural check
+in `test_deploy.py` used `ast.walk()`, which descends into nested scopes. A command defined in the
+wrong function, below a `return`, is *syntactically identical* to a registered one from `ast.walk`'s
+point of view. The suite was asking "is this code written?" when the only question that matters is
+"is this command **on the tree**?" It now builds a real `HubBot`, calls `build_tree()`, and asserts
+the 13 names against `tree.get_commands()` — plus a rule that no function may define another
+function after a `return`, which is the shape that caused it. Both fail loudly on the previous
+commit.
+
+Three smaller things came out of the same deploy:
+
+- The command was registered as **`setup_panel`** (discord.py derives the name from the function)
+  while the README and the operator checklist both say **`/setup-panel`**. It is now named
+  explicitly, and the tests cross-check every documented `/name` against the live tree.
+- `setup_panel` wrote `hub_channel_id` to config **before** attempting the post. When the post
+  raised 403 the pointer was already saved, so the 16:00 scheduler would have failed into that same
+  unusable channel every night after. Permissions are checked first now, and a `Forbidden` that
+  slips through anyway rolls the pointer back.
+- `50001 Missing Access` means both "I cannot see it" and "I cannot post in it", and the traceback
+  named neither the channel nor the permission. `_missing_perms()` asks `permissions_for` up front
+  and answers with the exact toggle — "missing **Send Messages** in #staff-only" — while degrading
+  to the old try/except when it cannot compute an answer, so it can never block a legitimate post.
+  `/pin-board` and `/pin-checkout` had the identical write-then-fail ordering and are fixed too.
+
 ### If the build fails
 
 | log line | cause | fix |
