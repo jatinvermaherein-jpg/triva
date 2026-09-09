@@ -19,6 +19,7 @@ SUITES = [
     ("service layer", "tests/test_bot_services.py"),
     ("button UI + permissions", "tests/test_bot_ui.py"),
     ("scheduler + outage recovery", "tests/test_bot_scheduler.py"),
+    ("async seam (loop never blocks on DB)", "tests/test_async_seam.py"),
     ("backend parity (sqlite vs postgres)", "tests/test_pg_parity.py"),
     ("cross-module references", "tests/test_symbols.py"),
     ("deploy: HUB_DB pastes + boot paths", "tests/test_deploy.py"),
