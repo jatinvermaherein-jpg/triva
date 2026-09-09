@@ -104,8 +104,8 @@ class HubView(discord.ui.View):
         # role is called anything else every staff control answered "That control is for
         # Hub Staff" and stopped - including /setup's own "Create everything" button,
         # which is why setup produced no channels and no log line.
-        if self.staff_only and not gate(interaction, getattr(self, "conn", None),
-                                        owner_bypass=self.owner_bypass):
+        if self.staff_only and not await gate_async(interaction, getattr(self, "conn", None),
+                                                    owner_bypass=self.owner_bypass):
             await interaction.response.send_message(
                 "That control is for **Hub Staff**.", ephemeral=True)
             return False
@@ -117,8 +117,8 @@ class HubView(discord.ui.View):
         Delegates to gate(), the same check a bare Item (StaffRoleSelect) has to use - the
         divergence between these two is what let `self._authorized` onto a non-View class.
         """
-        if gate(interaction, getattr(self, "conn", None),
-                owner_bypass=getattr(self, "owner_bypass", False)):
+        if await gate_async(interaction, getattr(self, "conn", None),
+                            owner_bypass=getattr(self, "owner_bypass", False)):
             return True
         if not interaction.response.is_done():
             await interaction.response.send_message(
@@ -212,6 +212,25 @@ def cfg_safe(conn, key, default=None):
         return default
 
 
+async def cfg_safe_async(conn, key, default=None):
+    """cfg_safe for async code paths: on Postgres the read runs in a worker thread,
+    so a stalled round trip cannot freeze the gateway loop mid-interaction."""
+    return await V.dbmod.acall(conn, cfg_safe, conn, key, default)
+
+
+async def gate_async(interaction, conn, *, staff_only: bool = True,
+                     owner_bypass: bool = False) -> bool:
+    """The async twin of gate(): identical decision, but the staff-role config read
+    goes through acall. Every button click passes through here BEFORE doing anything,
+    which made it one blocking round trip per interaction on the event loop."""
+    if not staff_only:
+        return True
+    user = interaction.user
+    if owner_bypass and _is_own_message(interaction, user):
+        return True
+    return is_staff(user, await cfg_safe_async(conn, "staff_role_id"))
+
+
 def install(bot, conn) -> None:
     """Register every persistent view BEFORE login, with no message_id, so
     dispatch works for panels posted days ago. Views here must be constructible
@@ -243,7 +262,7 @@ class StaffRoleSelect(discord.ui.RoleSelect):
     async def callback(self, interaction: discord.Interaction):
         # NOT self._authorized(): that is a HubView method and this is an Item. It raised
         # AttributeError on every real click, so the picker looked dead. See ui.gate().
-        if not gate(interaction, self.conn, owner_bypass=True):
+        if not await gate_async(interaction, self.conn, owner_bypass=True):
             await interaction.response.send_message(
                 "Only the person who ran `/setup` can pick the staff role.", ephemeral=True)
             return
@@ -267,14 +286,19 @@ class StaffRoleSelect(discord.ui.RoleSelect):
         # so record the pick now. provision() re-writes the same key from the same value;
         # this only exists to let the picker's own author click it.
         try:
-            V.dbmod.set_cfg(self.conn, "staff_role_id", int(role.id))
+            await V.dbmod.acall(self.conn, V.dbmod.set_cfg, self.conn, "staff_role_id",
+                                int(role.id))
         except Exception:
             pass                       # a failed convenience write must not eat the click
         self._stop_the_picker()
         # Never a bare edit_message(): ui.reply picks the method that is still legal for
         # this interaction and cannot raise on a dead token. clear_content because the
         # picker's prompt text is superseded by the plan below it.
-        if await reply(interaction, embed=setup_plan_embed(interaction, self.conn, role.id),
+        # setup_plan_embed makes ~15 config reads, so it builds off-loop like everything
+        # else that touches the database.
+        plan = await V.dbmod.acall(self.conn, setup_plan_embed, interaction, self.conn,
+                                   role.id)
+        if await reply(interaction, embed=plan,
                        view=SetupProvisionView(self.conn, role.id),
                        clear_content=True) == "dropped":
             log.warning("setup picker answered too late - the interaction had already "
@@ -440,8 +464,9 @@ class SetupProvisionView(HubView):
             return
         await i.response.defer(thinking=True, ephemeral=True)
         try:
-            staff_id = self.staff_role_id or int(
-                V.dbmod.cfg(self.conn, "staff_role_id") or 0)
+            staff_id = self.staff_role_id
+            if not staff_id:
+                staff_id = int(await cfg_safe_async(self.conn, "staff_role_id") or 0)
             if not staff_id:
                 return await i.followup.send(
                     "⚠️ I have no stored staff role - run `/setup mode:SETUP` again to "
@@ -508,7 +533,8 @@ class AnswerView(HubView):
         got = parse_cid(b.custom_id, 2)
         if got is None or not got[0].isdigit():
             return await i.response.send_message("Stale button.", ephemeral=True)
-        cleared = V.clear_answer(self.conn, int(got[0]), i.user.id)
+        cleared = await V.dbmod.acall(self.conn, V.clear_answer, self.conn, int(got[0]),
+                                      i.user.id)
         await i.response.send_message(
             "✅ Cleared - answer again before the timer." if cleared else
             "❌ Can't clear now: answers are locked once staff grade.", ephemeral=True)
@@ -519,7 +545,8 @@ class AnswerView(HubView):
         if not got:
             return await interaction.response.send_message("Stale button.", ephemeral=True)
         question_id, option = got
-        res = V.submit_answer(self.conn, question_id, interaction.user.id, option)
+        res = await V.dbmod.acall(self.conn, V.submit_answer, self.conn, question_id,
+                                  interaction.user.id, option)
         if not res["accepted"]:
             return await interaction.response.send_message(res["message"], ephemeral=True)
         word = "updated" if res["change"] == "edited" else "recorded"
@@ -595,7 +622,9 @@ class SubmitView(HubView):
         if not got:
             return await interaction.response.send_message("Stale button.", ephemeral=True)
         evening_id = got[0]
-        ev = self.conn.execute("SELECT * FROM evening WHERE id=?", (evening_id,)).fetchone()
+        ev = await V.dbmod.acall(
+            self.conn, lambda: self.conn.execute("SELECT * FROM evening WHERE id=?",
+                                                 (evening_id,)).fetchone())
         if not ev or ev["status"] not in ("open", "scheduled"):
             return await interaction.response.send_message(
                 "Tonight's window has closed.", ephemeral=True)
@@ -619,8 +648,8 @@ class AnswerModal(discord.ui.Modal, title="Your answer"):
                     "3) what breaks it + the switch  4) one thing they won't expect")
 
     async def on_submit(self, interaction: discord.Interaction):
-        res = V.create_submission(self.conn, self.evening_id, interaction.user.id,
-                                  self.answer.value)
+        res = await V.dbmod.acall(self.conn, V.create_submission, self.conn,
+                                  self.evening_id, interaction.user.id, self.answer.value)
         if not res["accepted"]:
             return await interaction.response.send_message(res["message"], ephemeral=True)
         notes = [f"✅ {res['word_count']} words",
@@ -689,7 +718,7 @@ class QuestionGradeView(HubView):
         qid = self._question_id(b)
         if qid is None:
             return
-        res = V.grade_question(self.conn, qid, None, i.user.id)
+        res = await V.dbmod.acall(self.conn, V.grade_question, self.conn, qid, None, i.user.id)
         await i.response.send_message(
             f"Question voided, nobody awarded. {res['questions_left_ungraded']} left "
             f"on this evening.", ephemeral=True)
@@ -703,7 +732,8 @@ class QuestionGradeView(HubView):
             return await interaction.response.send_message("Stale button.", ephemeral=True)
         question_id = got[0]
         try:
-            res = V.grade_question(self.conn, question_id, option, interaction.user.id)
+            res = await V.dbmod.acall(self.conn, V.grade_question, self.conn, question_id,
+                                      option, interaction.user.id)
         except ValueError as e:
             return await interaction.response.send_message(f"⚠️ {e}", ephemeral=True)
         top = ", ".join(f"<@{p}> +{p_}" for p, p_ in res["winners"][:5]) or "nobody"
@@ -769,22 +799,25 @@ class PointsModal(discord.ui.Modal, title="Points for a correct answer"):
         except ValueError:
             return await interaction.response.send_message("That is not a whole number.",
                                                             ephemeral=True)
-        q = self.conn.execute("SELECT correct_option FROM question WHERE id=?",
-                              (self.question_id,)).fetchone()
+        q = await V.dbmod.acall(
+            self.conn, lambda: self.conn.execute(
+                "SELECT correct_option FROM question WHERE id=?",
+                (self.question_id,)).fetchone())
         if q is None:
             return await interaction.response.send_message("That question no longer exists.",
                                                             ephemeral=True)
         try:
-            V.set_question_points(self.conn, self.question_id, value,
-                                  actor_id=interaction.user.id,
-                                  why=_modal_text(self, "why") or None)
+            await V.dbmod.acall(self.conn, V.set_question_points, self.conn,
+                                self.question_id, value, actor_id=interaction.user.id,
+                                why=_modal_text(self, "why") or None)
         except ValueError as e:
             return await interaction.response.send_message(f"⚠️ {e}", ephemeral=True)
         # Already graded? Then the new number is meaningless until the night is
         # recomputed - re-grade it rather than leave the board showing old maths.
         if q["correct_option"] is not None:
-            res = V.grade_question(self.conn, self.question_id, q["correct_option"],
-                                   actor_id=interaction.user.id)
+            res = await V.dbmod.acall(self.conn, V.grade_question, self.conn,
+                                      self.question_id, q["correct_option"],
+                                      actor_id=interaction.user.id)
             await _reedit_question_card(self.conn, interaction, self.question_id)
             await interaction.response.send_message(
                 f"🎯 **{value}** per correct answer · re-graded, "
@@ -801,7 +834,9 @@ class PointsModal(discord.ui.Modal, title="Points for a correct answer"):
 async def _reedit_question_card(conn, interaction, question_id: int) -> None:
     """Re-render the question card in place so its footer shows the truth
     (correct option + points), and swap the staff row to a locked state."""
-    row = conn.execute("SELECT message_id FROM question WHERE id=?", (question_id,)).fetchone()
+    row = await V.dbmod.acall(
+        conn, lambda: conn.execute("SELECT message_id FROM question WHERE id=?",
+                                   (question_id,)).fetchone())
     if not row or not row["message_id"]:
         return
     try:
@@ -867,19 +902,25 @@ class GradingView(HubView):
         await self._award(interaction, got[0], points, band, "next entry")
 
     async def _award(self, interaction, evening_id: int, points: int, band: str, label: str):
-        nxt = self.conn.execute(
-            "SELECT id, player_id, flag FROM submission WHERE evening_id=? "
-            "AND points_in IS NULL AND status='submitted' ORDER BY submitted_at LIMIT 1",
-            (evening_id,)).fetchone()
+        def _load():
+            nxt = self.conn.execute(
+                "SELECT id, player_id, flag FROM submission WHERE evening_id=? "
+                "AND points_in IS NULL AND status='submitted' ORDER BY submitted_at LIMIT 1",
+                (evening_id,)).fetchone()
+            mult = None
+            if nxt:
+                mult = self.conn.execute("SELECT multiplier FROM evening WHERE id=?",
+                                         (evening_id,)).fetchone()["multiplier"]
+            return nxt, mult
+        nxt, mult = await V.dbmod.acall(self.conn, _load)
         if not nxt:
             return await interaction.response.send_message(
                 "🎉 Nothing left to grade tonight.", ephemeral=True)
-        res = V.award_submission(self.conn, nxt["id"], points, interaction.user.id, band=band)
+        res = await V.dbmod.acall(self.conn, V.award_submission, self.conn, nxt["id"],
+                                  points, interaction.user.id, band=band)
         # A flag never changes the arithmetic - the staff number stands. It is
         # repeated here so the decision is made with the context in front of them.
         note = f"\n\n⚠️ Flagged `{nxt['flag']}` before awarding." if nxt["flag"] else ""
-        mult = self.conn.execute("SELECT multiplier FROM evening WHERE id=?",
-                                 (evening_id,)).fetchone()["multiplier"]
         after = (f" → **{res['points']}** after ×{mult:g}"
                  if res["points"] != points else "")
         left = res["submissions_left"]
@@ -908,15 +949,17 @@ class CustomPointModal(discord.ui.Modal, title="Custom points (0–25)"):
         except ValueError:
             return await interaction.response.send_message(
                 "That is not a whole number.", ephemeral=True)
-        nxt = self.conn.execute(
-            "SELECT id FROM submission WHERE evening_id=? AND points_in IS NULL "
-            "AND status='submitted' ORDER BY submitted_at LIMIT 1",
-            (self.evening_id,)).fetchone()
+        nxt = await V.dbmod.acall(
+            self.conn, lambda: self.conn.execute(
+                "SELECT id FROM submission WHERE evening_id=? AND points_in IS NULL "
+                "AND status='submitted' ORDER BY submitted_at LIMIT 1",
+                (self.evening_id,)).fetchone())
         if not nxt:
             return await interaction.response.send_message("Nothing left to grade.", ephemeral=True)
         try:
-            res = V.award_submission(self.conn, nxt["id"], value, interaction.user.id,
-                                     band=V.band_for(value), note=self.note.value or None)
+            res = await V.dbmod.acall(self.conn, V.award_submission, self.conn, nxt["id"],
+                                      value, interaction.user.id, band=V.band_for(value),
+                                      note=self.note.value or None)
         except ValueError as e:
             return await interaction.response.send_message(f"⚠️ {e}", ephemeral=True)
         await interaction.response.send_message(
@@ -1075,9 +1118,10 @@ class QuestionAuthorModal(discord.ui.Modal, title="Author a League 1 question"):
                     "Points must be 0-40. 40 is a brutal Sunday question.", ephemeral=True)
         suggested = V.default_points(tier)
         try:
-            res = V.add_question(self.conn, self.evening_id, None,   # None = next free slot
-                                 _modal_text(self, "prompt"), opts, tier=tier,
-                                 points_per_correct=base)
+            res = await V.dbmod.acall(
+                self.conn, V.add_question, self.conn, self.evening_id, None,
+                _modal_text(self, "prompt"), opts,       # None ordinal = next free slot
+                tier=tier, points_per_correct=base)
         except ValueError as e:
             return await interaction.response.send_message(f"⚠️ {e}", ephemeral=True)
         paid = base if base is not None else suggested
@@ -1102,8 +1146,10 @@ class PromptAuthorModal(discord.ui.Modal, title="Set the night's prompt"):
                                     required=False, max_length=5, placeholder="20:00")
 
     async def on_submit(self, interaction: discord.Interaction):
-        ev = self.conn.execute("SELECT day, league, status FROM evening WHERE id=?",
-                              (self.evening_id,)).fetchone()
+        ev = await V.dbmod.acall(
+            self.conn, lambda: self.conn.execute(
+                "SELECT day, league, status FROM evening WHERE id=?",
+                (self.evening_id,)).fetchone())
         if ev is None:
             return await interaction.response.send_message("That night no longer exists.",
                                                             ephemeral=True)
@@ -1112,9 +1158,10 @@ class PromptAuthorModal(discord.ui.Modal, title="Set the night's prompt"):
             return await interaction.response.send_message(
                 "That is too short to be a scenario - players need something to read.",
                 ephemeral=True)
-        V.set_scenario_prompt(self.conn, ev["day"], ev["league"], text,
-                             deadline=_modal_text(self, "deadline") or None,
-                             actor_id=interaction.user.id)
+        await V.dbmod.acall(self.conn, V.set_scenario_prompt, self.conn, ev["day"],
+                            ev["league"], text,
+                            deadline=_modal_text(self, "deadline") or None,
+                            actor_id=interaction.user.id)
         posted = "It will post at the opening time." if ev["status"] == "scheduled" \
             else "This night has already posted - use 🔄 Refresh on its card."
         await interaction.response.send_message(
@@ -1163,7 +1210,7 @@ class SeasonCreateModal(discord.ui.Modal, title="Create a Hub season"):
             else:
                 today = dt.date.today()
                 day = (today + dt.timedelta(days=(7 - today.weekday()) % 7 or 7)).isoformat()
-            res = V.create_season(self.conn, name, day, weeks)
+            res = await V.dbmod.acall(self.conn, V.create_season, self.conn, name, day, weeks)
         except (ValueError, TypeError, V.dbmod.IntegrityError) as exc:
             return await interaction.response.send_message(
                 f"⚠️ Use a valid date and a whole number of weeks from 1 to 8, "
@@ -1187,7 +1234,8 @@ class ChannelWireSelect(discord.ui.ChannelSelect):
         if not isinstance(parent, HubView) or not await parent._authorized(interaction):
             return
         channel = self.values[0]
-        V.dbmod.set_cfg(self.conn, f"channel:{self.league}", int(channel.id))
+        await V.dbmod.acall(self.conn, V.dbmod.set_cfg, self.conn,
+                            f"channel:{self.league}", int(channel.id))
         await interaction.response.edit_message(
             content=f"✅ {self.league.upper()} now posts in {channel.mention}.",
             embed=None, view=None)
@@ -1270,27 +1318,31 @@ class StaffPanelView(HubView):
                        custom_id=cid("sp", "preview"), row=0)
     async def preview(self, i, b):
         if await self._authorized(i):
-            await i.response.send_message(embed=season_preview_embed(self.conn), ephemeral=True)
+            embed = await V.dbmod.acall(self.conn, season_preview_embed, self.conn)
+            await i.response.send_message(embed=embed, ephemeral=True)
 
     @discord.ui.button(label="📚 Author L1", style=discord.ButtonStyle.primary,
                        custom_id=cid("sp", "question"), row=0)
     async def author_question(self, i, b):
         if await self._authorized(i):
+            # PickNightView queries the calendar inside its constructor - build off-loop.
+            view = await V.dbmod.acall(self.conn, PickNightView, self.conn, "question")
             await i.response.send_message(
                 embed=discord.Embed(title="📚 Author a League 1 question",
                                     description="Pick a night, then fill the question modal.",
                                     colour=LEAGUE_META["l1"][2]),
-                view=PickNightView(self.conn, "question"), ephemeral=True)
+                view=view, ephemeral=True)
 
     @discord.ui.button(label="⚔️ Set L2/L3", style=discord.ButtonStyle.primary,
                        custom_id=cid("sp", "prompt"), row=0)
     async def set_prompt(self, i, b):
         if await self._authorized(i):
+            view = await V.dbmod.acall(self.conn, PickNightView, self.conn, "prompt")
             await i.response.send_message(
                 embed=discord.Embed(title="⚔️ Set a League 2 / 3 night",
                                     description="Pick a night, then write the player card.",
                                     colour=LEAGUE_META["l2"][2]),
-                view=PickNightView(self.conn, "prompt"), ephemeral=True)
+                view=view, ephemeral=True)
 
     @discord.ui.button(label="📍 Wire channels", style=discord.ButtonStyle.secondary,
                        custom_id=cid("sp", "channels"), row=0)
@@ -1311,7 +1363,7 @@ class StaffPanelView(HubView):
             return await i.response.send_message("⚠️ Bot client is not ready.", ephemeral=True)
         await i.response.defer(ephemeral=True)
         count = 0
-        for ev in V.todays_evenings(self.conn):
+        for ev in await V.dbmod.acall(self.conn, V.todays_evenings, self.conn):
             if ev["status"] == "scheduled" and await bot.post_evening(ev):
                 count += 1
         await i.followup.send(f"Posted {count} league card set(s).", ephemeral=True)
@@ -1357,9 +1409,11 @@ class StaffPanelView(HubView):
                        custom_id=cid("sp", "payouts"), row=2)
     async def queue_payouts_button(self, i, b):
         if not await self._authorized(i): return
-        res = V.queue_payouts(self.conn)
-        await i.response.send_message(
-            f"🧾 {res['created']} checkout(s) queued; {V.pending_count(self.conn)} pending.",
+        await i.response.defer(ephemeral=True)
+        res = await V.dbmod.acall(self.conn, V.queue_payouts, self.conn)
+        pending = await V.dbmod.acall(self.conn, V.pending_count, self.conn)
+        await i.followup.send(
+            f"🧾 {res['created']} checkout(s) queued; {pending} pending.",
             ephemeral=True)
 
     @discord.ui.button(label="📤 Export ledger", style=discord.ButtonStyle.secondary,
@@ -1367,7 +1421,7 @@ class StaffPanelView(HubView):
     async def export_ledger(self, i, b):
         if not await self._authorized(i): return
         await i.response.defer(ephemeral=True)
-        data = ledger_csv(self.conn)
+        data = await V.dbmod.acall(self.conn, ledger_csv, self.conn)
         await i.followup.send(
             content=f"{data['rows']} ledger row(s). Every point is traceable.",
             file=discord.File(io.BytesIO(data["csv"].encode()), filename="hub-ledger.csv"),
@@ -1395,14 +1449,14 @@ class StaffPanelView(HubView):
                        custom_id=cid("sp", "status"), row=3)
     async def status(self, i, b):
         if await self._authorized(i):
-            await i.response.send_message(
-                embed=staff_status_embed(self.conn, i.guild), ephemeral=True)
+            embed = await V.dbmod.acall(self.conn, staff_status_embed, self.conn, i.guild)
+            await i.response.send_message(embed=embed, ephemeral=True)
 
     @discord.ui.button(label="🧰 Repair setup", style=discord.ButtonStyle.secondary,
                        custom_id=cid("sp", "repair"), row=3)
     async def repair(self, i, b):
         if not await self._authorized(i): return
-        staff_id = _configured_value(self.conn, "staff_role_id")
+        staff_id = await cfg_safe_async(self.conn, "staff_role_id")
         if not staff_id or i.guild is None:
             return await i.response.send_message(
                 "⚠️ No stored staff role or guild context. Use the one-time `/setup` bootstrap.",
@@ -1439,7 +1493,8 @@ class EveningView(HubView):
         if not got:
             return
         try:
-            V.close_evening(self.conn, got[0], i.user.id, reason="staff")
+            await V.dbmod.acall(self.conn, V.close_evening, self.conn, got[0], i.user.id,
+                                reason="staff")
         except ValueError as e:
             return await i.response.send_message(f"⚠️ {e}", ephemeral=True)
         await i.response.send_message(
@@ -1455,7 +1510,7 @@ class EveningView(HubView):
         if not got:
             return
         try:
-            res = V.finalize_l1(self.conn, got[0], i.user.id)
+            res = await V.dbmod.acall(self.conn, V.finalize_l1, self.conn, got[0], i.user.id)
         except ValueError as e:
             return await i.response.send_message(f"⚠️ {e}", ephemeral=True)
         top = "\n".join(f"<@{p}> — {pts} pts" for p, pts in res["top"][:5]) or "nobody scored"
@@ -1489,9 +1544,9 @@ class BoardView(HubView):
         if got is None:
             return
         scope = "league" if got[0] in ("l1", "l2", "l3") else got[0]
-        await interaction.response.edit_message(
-            embed=board_embed(self.conn, scope, None if scope != "league" else got[0]),
-            view=BoardView(self.conn))
+        embed = await V.dbmod.acall(self.conn, board_embed, self.conn, scope,
+                                    None if scope != "league" else got[0])
+        await interaction.response.edit_message(embed=embed, view=BoardView(self.conn))
 
 
 @persistent
@@ -1499,7 +1554,7 @@ class HubPanelView(HubView):
     @discord.ui.button(label="📚 Tonight", style=discord.ButtonStyle.primary,
                        custom_id=cid("hb", "tonight"))
     async def tonight(self, i, b):
-        rows = V.todays_evenings(self.conn)
+        rows = await V.dbmod.acall(self.conn, V.todays_evenings, self.conn)
         desc = "\n".join(
             f"{LEAGUE_META[r['league']][0]} **{r['league'].upper()}** — "
             f"{PHASE.get(r['status'])}" for r in rows) or "Nothing scheduled today."
@@ -1510,15 +1565,15 @@ class HubPanelView(HubView):
     @discord.ui.button(label="🏆 Standings", style=discord.ButtonStyle.success,
                        custom_id=cid("hb", "board"))
     async def board(self, i, b):
-        await i.response.edit_message(embed=standings_embed(self.conn, "season", None),
-                                      view=BoardView(self.conn))
+        embed = await V.dbmod.acall(self.conn, standings_embed, self.conn, "season", None)
+        await i.response.edit_message(embed=embed, view=BoardView(self.conn))
 
     @discord.ui.button(label="🏛️ Hall of Fame", style=discord.ButtonStyle.secondary,
                        custom_id=cid("hb", "hof"))
     async def hof(self, i, b):
-        rows = self.conn.execute(
+        rows = await V.dbmod.acall(self.conn, lambda: self.conn.execute(
             "SELECT h.*, s.name sn FROM hall_of_fame h JOIN season s ON s.id=h.season_id "
-            "ORDER BY h.season_id DESC, h.league, h.placement LIMIT 24").fetchall()
+            "ORDER BY h.season_id DESC, h.league, h.placement LIMIT 24").fetchall())
         e = discord.Embed(title="🏛️ Hall of Fame", colour=0xf1c40f)
         e.description = "\n".join(
             f"**{r['sn']}** · {LEAGUE_META[r['league']][0]} #{r['placement']} "
@@ -1542,7 +1597,7 @@ class HubPanelView(HubView):
     @discord.ui.button(label="📊 My stats", style=discord.ButtonStyle.secondary,
                        custom_id=cid("hb", "me"))
     async def me(self, i, b):
-        hist = V.points_history(self.conn, i.user.id)
+        hist = await V.dbmod.acall(self.conn, V.points_history, self.conn, i.user.id)
         e = discord.Embed(title=f"📊 {i.user.display_name}", colour=0x2f3136)
         if not hist:
             e.description = "No points yet tonight. Three questions, sixty seconds each."
@@ -1568,12 +1623,12 @@ class SeasonAdminView(HubView):
             return
         # same resolver finalize_season uses, so this list describes the same
         # season APPLY will change
-        sid = V.closing_season_id(self.conn)
+        sid = await V.dbmod.acall(self.conn, V.closing_season_id, self.conn)
         if sid is None:
             return await i.response.send_message(
                 "⚠️ No season to preview - create one with `/season-create` first.",
                 ephemeral=True)
-        diff = V.role_diff(self.conn, sid)
+        diff = await V.dbmod.acall(self.conn, V.role_diff, self.conn, sid)
         icon = {"add": "➕", "remove": "➖", "skip": "⏭️", "manual": "🖐"}
         lines = [f"{icon.get(d['action'], '·')} {d['why']}" for d in diff] or ["*nothing*"]
         e = discord.Embed(title=f"Season {sid} end — DRY RUN (nothing changed)",
@@ -1793,10 +1848,10 @@ def _configured_value(conn, key: str, default=None):
 async def _resolve_configured_channel(conn, key: str):
     """Resolve one stored channel id through the bound client, never by name."""
     bot = _BOT
-    channel_id = _configured_value(conn, V._hubkey("channel", key))
+    channel_id = await cfg_safe_async(conn, V._hubkey("channel", key))
     if key == "hub":
-        channel_id = (channel_id or _configured_value(conn, "hub_channel_id")
-                      or _configured_value(conn, "hub:hub"))
+        channel_id = (channel_id or await cfg_safe_async(conn, "hub_channel_id")
+                      or await cfg_safe_async(conn, "hub:hub"))
     if not channel_id or bot is None:
         return None
     channel = bot.get_channel(int(channel_id)) if hasattr(bot, "get_channel") else None
@@ -1810,7 +1865,7 @@ async def _resolve_configured_channel(conn, key: str):
 
 async def _post_or_update(conn, channel, *, embed, view, message_key: str):
     """Edit a previously posted panel or create it once, idempotently."""
-    old_id = _configured_value(conn, message_key)
+    old_id = await cfg_safe_async(conn, message_key)
     if old_id and hasattr(channel, "fetch_message"):
         try:
             message = await channel.fetch_message(int(old_id))
@@ -1819,8 +1874,10 @@ async def _post_or_update(conn, channel, *, embed, view, message_key: str):
         except (discord.NotFound, discord.Forbidden, discord.HTTPException):
             pass
     message = await channel.send(embed=embed, view=view)
-    V.dbmod.set_cfg(conn, message_key, int(message.id))
-    V.dbmod.set_cfg(conn, f"{message_key}:channel", int(channel.id))
+    def _store():
+        V.dbmod.set_cfg(conn, message_key, int(message.id))
+        V.dbmod.set_cfg(conn, f"{message_key}:channel", int(channel.id))
+    await V.dbmod.acall(conn, _store)
     return message, True
 
 
@@ -1829,10 +1886,11 @@ async def post_hub_panel(conn) -> dict:
     if channel is None:
         return {"ok": False, "message": "⚠️ The provisioned hub channel is unavailable. Run setup/status."}
     try:
+        embed = await V.dbmod.acall(conn, hub_embed, conn)
         message, created = await _post_or_update(
-            conn, channel, embed=hub_embed(conn), view=HubPanelView(conn),
+            conn, channel, embed=embed, view=HubPanelView(conn),
             message_key="hub_panel_message_id")
-        V.dbmod.set_cfg(conn, "hub_channel_id", int(channel.id))
+        await V.dbmod.acall(conn, V.dbmod.set_cfg, conn, "hub_channel_id", int(channel.id))
         return {"ok": True, "message": f"📢 Hub panel {'posted' if created else 'refreshed'} in {channel.mention}."}
     except discord.HTTPException:
         return {"ok": False, "message": "⚠️ Discord refused the hub panel. Check View Channel, Send Messages and Embed Links."}
@@ -1843,12 +1901,14 @@ async def post_board_panel(conn) -> dict:
     if channel is None:
         return {"ok": False, "message": "⚠️ The provisioned league-table channel is unavailable."}
     try:
+        embed = await V.dbmod.acall(conn, board_embed, conn, "season", None)
         message, created = await _post_or_update(
-            conn, channel, embed=board_embed(conn, "season", None), view=BoardView(conn),
+            conn, channel, embed=embed, view=BoardView(conn),
             message_key="board_panel_message_id")
         # board_panels() supports every legacy `board:<message>` key too; retain it
         # so old pins continue to refresh after this button is used.
-        V.dbmod.set_cfg(conn, f"board:{message.id}", int(channel.id))
+        await V.dbmod.acall(conn, V.dbmod.set_cfg, conn, f"board:{message.id}",
+                            int(channel.id))
         return {"ok": True, "message": f"📌 Leaderboard {'posted' if created else 'refreshed'} in {channel.mention}."}
     except discord.HTTPException:
         return {"ok": False, "message": "⚠️ Discord refused posting the leaderboard."}
@@ -1859,12 +1919,14 @@ async def post_checkout_panel(conn) -> dict:
     if channel is None:
         return {"ok": False, "message": "⚠️ The provisioned pending-checkout channel is unavailable."}
     try:
-        rows = V.pending_payouts(conn)
+        rows = await V.dbmod.acall(conn, V.pending_payouts, conn)
+        embed = await V.dbmod.acall(conn, checkout_embed, conn)
+        view = (await V.dbmod.acall(conn, CheckoutView, conn) if rows else no_controls())
         message, created = await _post_or_update(
-            conn, channel, embed=checkout_embed(conn),
-            view=CheckoutView(conn) if rows else no_controls(),
+            conn, channel, embed=embed, view=view,
             message_key="checkout_panel_message_id")
-        V.dbmod.set_cfg(conn, f"checkout:{message.id}", int(channel.id))
+        await V.dbmod.acall(conn, V.dbmod.set_cfg, conn, f"checkout:{message.id}",
+                            int(channel.id))
         return {"ok": True, "message": f"🧾 Checkout {'posted' if created else 'refreshed'} in {channel.mention}."}
     except discord.HTTPException:
         return {"ok": False, "message": "⚠️ Discord refused posting the checkout panel."}
@@ -1947,12 +2009,12 @@ def staff_guide_embed() -> discord.Embed:
 async def post_staff_guide(conn, guild=None) -> dict:
     channel = await _resolve_configured_channel(conn, "staff")
     if channel is None and guild is not None:
-        channel_id = _configured_value(conn, V._hubkey("channel", "staff"))
+        channel_id = await cfg_safe_async(conn, V._hubkey("channel", "staff"))
         channel = guild.get_channel(channel_id) if channel_id else None
     if channel is None:
         return {"ok": False, "message": "⚠️ The provisioned #staff-only channel is unavailable."}
     try:
-        old_id = _configured_value(conn, "staff_guide_message_id")
+        old_id = await cfg_safe_async(conn, "staff_guide_message_id")
         if old_id:
             try:
                 msg = await channel.fetch_message(int(old_id))
@@ -1961,7 +2023,7 @@ async def post_staff_guide(conn, guild=None) -> dict:
             except (discord.NotFound, discord.Forbidden, discord.HTTPException):
                 pass
         msg = await channel.send(embed=staff_guide_embed())
-        V.dbmod.set_cfg(conn, "staff_guide_message_id", int(msg.id))
+        await V.dbmod.acall(conn, V.dbmod.set_cfg, conn, "staff_guide_message_id", int(msg.id))
         return {"ok": True, "message": "📖 Staff guide posted in #staff-only."}
     except discord.HTTPException:
         return {"ok": False, "message": "⚠️ Discord refused posting the staff guide."}
@@ -1974,7 +2036,7 @@ async def post_staff_workspace(guild, conn) -> dict:
     deleted channel. Existing messages are edited where possible, not spammed into
     the staff channel on every deployment.
     """
-    channel_id = _configured_value(conn, V._hubkey("channel", "staff"))
+    channel_id = await cfg_safe_async(conn, V._hubkey("channel", "staff"))
     channel = guild.get_channel(channel_id) if guild and channel_id else None
     if channel is None and _BOT is not None and channel_id:
         try:
@@ -1984,17 +2046,19 @@ async def post_staff_workspace(guild, conn) -> dict:
     if channel is None:
         return {"ok": False, "message": "⚠️ Staff channel was provisioned but could not be fetched; use Repost staff guide after ready."}
     try:
-        panel_id = _configured_value(conn, "staff_panel_message_id")
+        panel_id = await cfg_safe_async(conn, "staff_panel_message_id")
         if panel_id:
             try:
                 panel = await channel.fetch_message(int(panel_id))
                 await panel.edit(embed=staff_panel_embed(conn), view=StaffPanelView(conn))
             except (discord.NotFound, discord.Forbidden, discord.HTTPException):
                 panel = await channel.send(embed=staff_panel_embed(conn), view=StaffPanelView(conn))
-                V.dbmod.set_cfg(conn, "staff_panel_message_id", int(panel.id))
+                await V.dbmod.acall(conn, V.dbmod.set_cfg, conn,
+                                    "staff_panel_message_id", int(panel.id))
         else:
             panel = await channel.send(embed=staff_panel_embed(conn), view=StaffPanelView(conn))
-            V.dbmod.set_cfg(conn, "staff_panel_message_id", int(panel.id))
+            await V.dbmod.acall(conn, V.dbmod.set_cfg, conn,
+                                "staff_panel_message_id", int(panel.id))
         guide = await post_staff_guide(conn, guild)
         return {"ok": True, "message": "🛠️ Staff panel and guide are live in #staff-only. "
                                     + guide["message"]}
@@ -2025,7 +2089,10 @@ async def _refresh_boards(conn, interaction) -> None:
     bot = _BOT or getattr(interaction, "client", None)
     if bot is None or not hasattr(bot, "get_channel"):
         return
-    panels = V.board_panels(conn)
+    panels = await V.dbmod.acall(conn, V.board_panels, conn)
+    if not panels:
+        return
+    embed = await V.dbmod.acall(conn, board_embed, conn, "season", None)
     for row in panels:
         try:
             _, mid = row["key"].split(":", 1)
@@ -2036,7 +2103,7 @@ async def _refresh_boards(conn, interaction) -> None:
             if channel is None:
                 channel = await bot.fetch_channel(int(row["value"]))
             msg = await channel.fetch_message(int(mid))
-            await msg.edit(embed=board_embed(conn, "season", None), view=BoardView(conn))
+            await msg.edit(embed=embed, view=BoardView(conn))
         except Exception:
             continue                      # deleted / no access / offline: keep trying later
 
@@ -2085,10 +2152,14 @@ class CheckoutView(HubView):
         a stale card must always be one tap from the truth."""
         if not await self._authorized(interaction):
             return
-        rows = V.pending_payouts(self.conn)
-        await interaction.response.edit_message(
-            embed=checkout_embed(self.conn, min(self.page, max(0, len(V.payout_batches(self.conn)) - 1))),
-            view=CheckoutView(self.conn, self.page) if rows else _no_controls())
+        def _load():
+            rows = V.pending_payouts(self.conn)
+            page = min(self.page, max(0, len(V.payout_batches(self.conn)) - 1))
+            return rows, checkout_embed(self.conn, page)
+        rows, embed = await V.dbmod.acall(self.conn, _load)
+        view = (await V.dbmod.acall(self.conn, CheckoutView, self.conn, self.page)
+                if rows else _no_controls())
+        await interaction.response.edit_message(embed=embed, view=view)
 
 
 def checkout_embed(conn, page: int = 0, note: str | None = None) -> discord.Embed:
@@ -2128,23 +2199,27 @@ def _make_tool_callback(conn, mode: str, parent_view: HubView | None = None):
         if parent_view is not None:
             allowed = await parent_view._authorized(interaction)
         else:
-            allowed = gate(interaction, conn)
+            allowed = await gate_async(interaction, conn)
             if not allowed and not interaction.response.is_done():
                 await interaction.response.send_message(
                     "That control is for **Hub Staff**.", ephemeral=True)
         if not allowed:
             return
         if mode == "checkout":
-            e = checkout_embed(conn)
-            return await interaction.response.edit_message(
-                embed=e, view=CheckoutView(conn) if V.pending_payouts(conn) else _no_controls())
+            def _load_checkout():
+                return (checkout_embed(conn), bool(V.pending_payouts(conn)))
+            e, has_rows = await V.dbmod.acall(conn, _load_checkout)
+            view = (await V.dbmod.acall(conn, CheckoutView, conn)
+                    if has_rows else _no_controls())
+            return await interaction.response.edit_message(embed=e, view=view)
         title, blurb = NIGHT_LABELS[mode]
         e = discord.Embed(title=title, description=blurb, colour=0x2f3136)
-        nights = V.authorable_nights(conn)
+        nights = await V.dbmod.acall(conn, V.authorable_nights, conn)
         set_field(e, "Nights open for content",
                 "\n".join(f"{n['day']} · {n['league'].upper()} · "
                            f"{n['questions']}Q" for n in nights[:6]) or "—")
-        await interaction.response.edit_message(embed=e, view=PickNightView(conn, mode))
+        view = await V.dbmod.acall(conn, PickNightView, conn, mode)
+        await interaction.response.edit_message(embed=e, view=view)
     return _tool
 
 
@@ -2153,7 +2228,8 @@ def _make_clear_callback(view, payout_id: int):
         if not await view._authorized(interaction):
             return
         try:
-            res = V.clear_payout(view.conn, payout_id, interaction.user.id)
+            res = await V.dbmod.acall(view.conn, V.clear_payout, view.conn, payout_id,
+                                      interaction.user.id)
         except ValueError as e:
             return await interaction.response.send_message(f"⚠️ {e}", ephemeral=True)
         if res.get("already"):
@@ -2161,14 +2237,16 @@ def _make_clear_callback(view, payout_id: int):
                 "⚠️ Already cleared by someone else — nothing was sent twice.",
                 ephemeral=True)
         page = view.page
-        batches = V.payout_batches(view.conn)
+        batches = await V.dbmod.acall(view.conn, V.payout_batches, view.conn)
         if not batches:
-            await interaction.response.edit_message(embed=checkout_embed(view.conn),
-                                                    view=_no_controls())
+            embed = await V.dbmod.acall(view.conn, checkout_embed, view.conn)
+            await interaction.response.edit_message(embed=embed, view=_no_controls())
             return
         page = min(page, len(batches) - 1)      # last row cleared: fall back a page
-        await interaction.response.edit_message(embed=checkout_embed(view.conn, page),
-                                                view=CheckoutView(view.conn, page))
+        def _rerender():
+            return checkout_embed(view.conn, page), CheckoutView(view.conn, page)
+        embed, new_view = await V.dbmod.acall(view.conn, _rerender)
+        await interaction.response.edit_message(embed=embed, view=new_view)
         left = res.get("remaining")
         await interaction.followup.send(
             f"✅ Marked paid: <@{res['player_id']}> {res['kind']} {res['amount']:,}."
@@ -2182,8 +2260,10 @@ def _make_refresh_callback(view):
     async def _refresh(interaction: discord.Interaction):
         if not await view._authorized(interaction):
             return
-        await interaction.response.edit_message(embed=checkout_embed(view.conn),
-                                                view=CheckoutView(view.conn))
+        def _rerender():
+            return checkout_embed(view.conn), CheckoutView(view.conn)
+        embed, new_view = await V.dbmod.acall(view.conn, _rerender)
+        await interaction.response.edit_message(embed=embed, view=new_view)
     return _refresh
 
 

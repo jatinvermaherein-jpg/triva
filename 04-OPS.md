@@ -84,6 +84,7 @@ Break any of these and panels start dying after deploys:
 | Nothing posted in `#league-2` on a Monday | there is no Monday L2 night | Not an outage. See the row above |
 | A whole night vanished after a re-grade | you widened `UNIQUE(ledger.evening_id, player_id)` | Put it back. Rebuilds depend on it |
 | "FOREIGN KEY constraint failed" while authoring | the night is `locked`/`graded`, or you picked an L2/L3 night for a question | Now reported properly. Questions go on L1 nights that haven't finished |
+| Log shows `heartbeat blocked for more than 10 seconds`, bot goes quiet | a database round trip stalled and ran **on the event loop**, so the gateway could not heartbeat | Fixed: every DB call from async code goes through `db.acall()` and runs in a worker thread; `_pg_connect()` adds `connect_timeout=10` + TCP keepalives (~1-minute fuse) so a dead pooler link heals instead of hanging. If it ever recurs, the loop dump now names the DB call that blocked |
 | Player says "my answer didn't count" | answered after auto-lock, or edited after grading | `ledger` + `audit` have exact timestamps; `📊 My stats` shows their trail |
 | Points look wrong | — | `V.adjust_points(conn, player, delta, reason, actor)` writes a **new** row, never an edit. Standings are derived, so the table fixes itself. Needs a non-blank reason |
 | A player is missing from the league table | they are under the **5-night floor** | Intended for podiums only. Their points and coins still count, and the card says how many were excluded |

@@ -217,8 +217,11 @@ async def provision(conn, ws, staff_role_id: int | None = None,
             await sync_role_appearance(picked, colour, hoist)
             note("role", key, picked.name, picked, False, "selected")
             continue
-        obj, adopted = _adopt(ws, conn, "role", key, name, ws.get_role,
-                             lambda _k, n: ws.find_role(n))
+        # _adopt reads config - a WAN round trip on Postgres - so it runs through
+        # acall like every other DB touch on this async path (a stuck read here must
+        # not stop the gateway heartbeat mid-setup).
+        obj, adopted = await dbmod.acall(conn, _adopt, ws, conn, "role", key, name,
+                                         ws.get_role, lambda _k, n: ws.find_role(n))
         if obj is None:
             obj = await ws.create_role(name=name, colour=colour, hoist=hoist,
                                        reason="Hub Knowledge Season /setup")
@@ -235,8 +238,9 @@ async def provision(conn, ws, staff_role_id: int | None = None,
     # ---- category ------------------------------------------------------- #
     cat_obj = None
     if category:
-        obj, adopted = _adopt(ws, conn, "category", "category", CATEGORY_NAME,
-                              ws.get_channel, lambda _k, n: ws.find_channel(_k, n))
+        obj, adopted = await dbmod.acall(conn, _adopt, ws, conn, "category", "category",
+                                         CATEGORY_NAME, ws.get_channel,
+                                         lambda _k, n: ws.find_channel(_k, n))
         if obj is None:
             # everyone_read=True ON PURPOSE: a deny on the category cascades to every
             # public league channel under it. Privacy is enforced per channel only.
@@ -250,8 +254,8 @@ async def provision(conn, ws, staff_role_id: int | None = None,
 
     # ---- channels ------------------------------------------------------- #
     for key, name, staff_only, slow, _why in PROVISION_CHANNELS:
-        obj, adopted = _adopt(ws, conn, "channel", key, name, ws.get_channel,
-                              ws.find_channel)
+        obj, adopted = await dbmod.acall(conn, _adopt, ws, conn, "channel", key, name,
+                                         ws.get_channel, ws.find_channel)
         if obj is None:
             obj = await ws.create_channel(
                 name=name, category=cat_obj, slowmode=slow,
@@ -265,21 +269,25 @@ async def provision(conn, ws, staff_role_id: int | None = None,
             # /setup-channel follow-up. An existing hand-set mapping is left alone:
             # /setup-channel still wins, as an override rather than an accident.
             lg = key[len("league_"):]
-            if dbmod.cfg(conn, f"channel:{lg}") is None:
+            if await dbmod.acall(conn, dbmod.cfg, conn, f"channel:{lg}") is None:
                 legacy[f"channel:{lg}"] = int(obj.id)
 
-    with conn:
-        for key, value in ids.items():      # already the full config key
-            dbmod.set_cfg(conn, key, value)
-        for key, value in legacy.items():
-            dbmod.set_cfg(conn, key, value)
-        dbmod.set_cfg(conn, "staff_role_id", staff_id)
-    _bind_season_roles(conn)
-    dbmod.audit(conn, "hub.provision", actor_id, None, None,
-                {"entries": len(made),
-                 "created": sum(1 for m in made if m["created"]),
-                 "adopted": sum(1 for m in made if not m["created"]),
-                 "staff_role_id": staff_id})
+    # The whole id-writeback is ONE transaction on ONE worker thread: a `with conn:`
+    # block handed to acall stays atomic, exactly as it is when called inline.
+    def _store_ids():
+        with conn:
+            for key, value in ids.items():      # already the full config key
+                dbmod.set_cfg(conn, key, value)
+            for key, value in legacy.items():
+                dbmod.set_cfg(conn, key, value)
+            dbmod.set_cfg(conn, "staff_role_id", staff_id)
+        _bind_season_roles(conn)
+        dbmod.audit(conn, "hub.provision", actor_id, None, None,
+                    {"entries": len(made),
+                     "created": sum(1 for m in made if m["created"]),
+                     "adopted": sum(1 for m in made if not m["created"]),
+                     "staff_role_id": staff_id})
+    await dbmod.acall(conn, _store_ids)
     return {"entries": made,
             "created": [m for m in made if m["created"]],
             "reused": [m for m in made if not m["created"]],
@@ -1305,30 +1313,35 @@ async def finalize_season(conn, actor_id: int, apply_roles: bool = False,
     # The season being closed: the active one, or - if a rollover already ran and
     # nothing is active - the newest. Every step below uses THIS id; none of them is
     # allowed to re-resolve it, or a re-run after a rollover acts on the wrong season.
-    sid = closing_season_id(conn)
+    # Every DB step goes through acall: this runs from a button click, on the gateway
+    # loop, and a stuck WAN read must not stop the heartbeat mid-season-close.
+    sid = await dbmod.acall(conn, closing_season_id, conn)
     if not sid:
         raise ValueError("no season to close - create one first")
-    report = season_report(conn, sid)
+    report = await dbmod.acall(conn, season_report, conn, sid)
     hall_rows = []
     for league in ("l1", "l2", "l3"):
         # only players who actually scored make the wall - otherwise a 3-person
         # league hands 3rd place (and a HoF entry) to someone on 0 points.
         for row in [r for r in report["leagues"][league] if r["points"] > 0][:3]:
             hall_rows.append((sid, league, row["player_id"], row["rank"], row["points"]))
-    with conn:
-        for _sid, league, pid, place, pts in hall_rows:
-            # ON CONFLICT UPDATE (not INSERT OR REPLACE): a re-run must never
-            # destroy the post_id / role_id already attached to a champion.
-            conn.execute(
-                "INSERT INTO hall_of_fame(season_id,league,player_id,placement,points) "
-                "VALUES(?,?,?,?,?) ON CONFLICT(season_id,league,placement) DO UPDATE SET "
-                "player_id=excluded.player_id, points=excluded.points",
-                (_sid, league, pid, place, pts))
-        conn.execute("UPDATE season SET status='closed' WHERE id=?", (sid,))
-        dbmod.audit(conn, "season.finalize", actor_id, sid, None,
-                    {"champions": [(r[1], r[2]) for r in hall_rows if r[3] == 1],
-                     "apply_roles": apply_roles})
-    diff = role_diff(conn, sid)
+
+    def _close():
+        with conn:
+            for _sid, league, pid, place, pts in hall_rows:
+                # ON CONFLICT UPDATE (not INSERT OR REPLACE): a re-run must never
+                # destroy the post_id / role_id already attached to a champion.
+                conn.execute(
+                    "INSERT INTO hall_of_fame(season_id,league,player_id,placement,points) "
+                    "VALUES(?,?,?,?,?) ON CONFLICT(season_id,league,placement) DO UPDATE SET "
+                    "player_id=excluded.player_id, points=excluded.points",
+                    (_sid, league, pid, place, pts))
+            conn.execute("UPDATE season SET status='closed' WHERE id=?", (sid,))
+            dbmod.audit(conn, "season.finalize", actor_id, sid, None,
+                        {"champions": [(r[1], r[2]) for r in hall_rows if r[3] == 1],
+                         "apply_roles": apply_roles})
+    await dbmod.acall(conn, _close)
+    diff = await dbmod.acall(conn, role_diff, conn, sid)
     applied = []
     if apply_roles and guild is not None:
         applied = await _apply_roles(guild, diff, conn, sid)
@@ -1357,7 +1370,8 @@ async def _apply_roles(guild, diff: list[dict], conn=None, season: int | None = 
                 await member.add_roles(role, reason=f"Hub Knowledge Season · {act['why']}")
                 done.append(f"➕ {role.name} → {member}")
                 if conn is not None and act.get("league") and season:
-                    _stamp_hof_role(conn, member.id, act["league"], role.id, season)
+                    await dbmod.acall(conn, _stamp_hof_role, conn, member.id,
+                                      act["league"], role.id, season)
             elif act["action"] == "remove" and role in member.roles:
                 await member.remove_roles(role, reason=f"Hub Knowledge Season · {act['why']}")
                 done.append(f"➖ {role.name} ← {member}")

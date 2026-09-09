@@ -86,14 +86,20 @@ class HubBot(commands.Bot):
         ui.bind_bot(self)
         # /setup names this "hub" (announcements); /setup-channel calls it
         # hub_channel_id. Both are honoured; whichever was configured last wins.
-        self.hub_channel_id = (D.cfg(self.conn, "hub_channel_id")
-                               or D.cfg(self.conn, V._hubkey("channel", "hub"))
-                               or D.cfg(self.conn, "hub:hub"))
+        # DB reads go through acall: on Postgres each one is a WAN round trip, and
+        # nothing in the bot may block the event loop on a socket.
+        def _hub_channel_id():
+            return (D.cfg(self.conn, "hub_channel_id")
+                    or D.cfg(self.conn, V._hubkey("channel", "hub"))
+                    or D.cfg(self.conn, "hub:hub"))
+        self.hub_channel_id = await D.acall(self.conn, _hub_channel_id)
         self.loop.create_task(self.clock())
         await self.backfill()
+        pending = await D.acall(
+            self.conn, lambda: self.conn.execute(
+                "SELECT COUNT(*) c FROM evening WHERE status='scheduled'").fetchone()["c"])
         log.info("registered %d persistent views; %d evenings pending",
-                 len(ui.PERSISTENT_VIEWS), self.conn.execute(
-                     "SELECT COUNT(*) c FROM evening WHERE status='scheduled'").fetchone()["c"])
+                 len(ui.PERSISTENT_VIEWS), pending)
 
     async def on_ready(self):
         log.info("logged in as %s (%s)", self.user, self.user.id)
@@ -133,20 +139,24 @@ class HubBot(commands.Bot):
     async def tick(self, now: dt.datetime | None = None) -> dict:
         now = V.ist(now or dt.datetime.now(V.IST))
         opened, locked = [], []
+        now_iso = now.isoformat(timespec="seconds")
         # channel_id is resolved inside post_evening from config; the evening row
         # itself only carries one once it has actually posted.
-        due = self.conn.execute(
+        # Both queries and close_evening run through acall: tick() shares the loop with
+        # the gateway, and a stalled Postgres read must not freeze the heartbeat.
+        due = await D.acall(self.conn, lambda: self.conn.execute(
             "SELECT e.* FROM evening e JOIN season s ON s.id=e.season_id "
             "WHERE e.status='scheduled' AND e.opens_at<=? AND s.status='active' "
-            "ORDER BY e.day, e.league", (now.isoformat(timespec="seconds"),)).fetchall()
+            "ORDER BY e.day, e.league", (now_iso,)).fetchall())
         for ev in due:
             if await self.post_evening(dict(ev)):
                 opened.append(ev["id"])
-        stale = self.conn.execute(
+        stale = await D.acall(self.conn, lambda: self.conn.execute(
             "SELECT * FROM evening WHERE status='open' AND closes_at<=?",
-            (now.isoformat(timespec="seconds"),)).fetchall()
+            (now_iso,)).fetchall())
         for ev in stale:
-            V.close_evening(self.conn, ev["id"], None, reason="auto timer")
+            await D.acall(self.conn, V.close_evening, self.conn, ev["id"], None,
+                          reason="auto timer")
             locked.append(ev["id"])
             await self._edit_evening_cards(ev["id"])
         return {"opened": opened, "locked": locked}
@@ -164,13 +174,13 @@ class HubBot(commands.Bot):
         now = V.ist(now or dt.datetime.now(V.IST))
         since = (now - dt.timedelta(hours=24)).isoformat(timespec="seconds")
         until = now.isoformat(timespec="seconds")
-        scheduled = self.conn.execute(
+        scheduled = await D.acall(self.conn, lambda: self.conn.execute(
             "SELECT e.* FROM evening e JOIN season s ON s.id=e.season_id "
             "WHERE ((e.status='scheduled' AND NOT EXISTS (SELECT 1 FROM question q "
             "  WHERE q.evening_id=e.id AND q.correct_option IS NOT NULL)) "
             " OR (e.status='open')) AND e.opens_at<=? AND e.opens_at>=? "
             "AND s.status='active' ORDER BY e.day, e.league LIMIT 9",
-            (until, since)).fetchall()
+            (until, since)).fetchall())
         posted = 0
         recovered_ids: set[int] = set()
         for ev in scheduled:
@@ -185,15 +195,16 @@ class HubBot(commands.Bot):
             if await self.post_evening(dict(ev), backfill=True, now=now):
                 posted += 1
                 recovered_ids.add(ev["id"])
-        stranded = self.conn.execute(
+        stranded = await D.acall(self.conn, lambda: self.conn.execute(
             "SELECT * FROM evening WHERE status='open' AND message_id IS NOT NULL "
-            "AND closes_at<=?", (until,)).fetchall()
+            "AND closes_at<=?", (until,)).fetchall())
         for ev in stranded:
             if ev["id"] in recovered_ids:
                 continue          # posted seconds ago by this very method
             log.warning("evening %s %s was opened but never closed (crash?) - locking",
                         ev["day"], ev["league"])
-            V.close_evening(self.conn, ev["id"], None, reason="recovered after downtime")
+            await D.acall(self.conn, V.close_evening, self.conn, ev["id"], None,
+                          reason="recovered after downtime")
             await self._edit_evening_cards(ev["id"])
         return posted + len(stranded)
 
@@ -207,33 +218,39 @@ class HubBot(commands.Bot):
         than not posting. Same length, same speed-bonus curve, so the night stays
         comparable to everyone else's.
         """
-        # Re-read, never trust the row the caller handed us: tick() may have
-        # locked this evening between the query and now.
-        fresh = self.conn.execute("SELECT * FROM evening WHERE id=?", (evening_id,)).fetchone()
-        opens, closes = V.parse_iso(fresh["opens_at"]), V.parse_iso(fresh["closes_at"])
-        length = max(dt.timedelta(seconds=60), closes - opens)
-        # ONE clock per operation. Using the real wall clock here while the caller
-        # reasons about `now` is what let a recovered evening be "expired" the
-        # instant it was posted.
-        new_open = V.ist(now or dt.datetime.now(V.IST))
-        with self.conn:
-            self.conn.execute("UPDATE evening SET opens_at=?, closes_at=?, status='open' "
-                              "WHERE id=?",
-                              (new_open.isoformat(timespec="seconds"),
-                               (new_open + length).isoformat(timespec="seconds"), evening_id))
-            # shift every question deadline by the same delta so the speed-bonus
-            # curve is measured from the moment cards actually appear
-            delta = new_open - opens
-            rows = self.conn.execute("SELECT id, answer_deadline FROM question "
-                                     "WHERE evening_id=?", (evening_id,)).fetchall()
-            for r in rows:
-                new_deadline = V.parse_iso(r["answer_deadline"]) + delta
-                self.conn.execute("UPDATE question SET answer_deadline=? WHERE id=?",
-                                  (new_deadline.isoformat(timespec="seconds"), r["id"]))
-        D.audit(self.conn, "evening.window_recovered", None, evening_id,
-                {"opens": fresh["opens_at"], "closes": fresh["closes_at"]},
-                {"opens": new_open.isoformat(timespec="seconds"),
-                 "reason": "backfill after downtime"})
+        def _extend():
+            # Re-read, never trust the row the caller handed us: tick() may have
+            # locked this evening between the query and now.
+            fresh = self.conn.execute("SELECT * FROM evening WHERE id=?",
+                                      (evening_id,)).fetchone()
+            opens, closes = V.parse_iso(fresh["opens_at"]), V.parse_iso(fresh["closes_at"])
+            length = max(dt.timedelta(seconds=60), closes - opens)
+            # ONE clock per operation. Using the real wall clock here while the caller
+            # reasons about `now` is what let a recovered evening be "expired" the
+            # instant it was posted.
+            new_open = V.ist(now or dt.datetime.now(V.IST))
+            with self.conn:
+                self.conn.execute("UPDATE evening SET opens_at=?, closes_at=?, status='open' "
+                                  "WHERE id=?",
+                                  (new_open.isoformat(timespec="seconds"),
+                                   (new_open + length).isoformat(timespec="seconds"),
+                                   evening_id))
+                # shift every question deadline by the same delta so the speed-bonus
+                # curve is measured from the moment cards actually appear
+                delta = new_open - opens
+                rows = self.conn.execute("SELECT id, answer_deadline FROM question "
+                                         "WHERE evening_id=?", (evening_id,)).fetchall()
+                for r in rows:
+                    new_deadline = V.parse_iso(r["answer_deadline"]) + delta
+                    self.conn.execute("UPDATE question SET answer_deadline=? WHERE id=?",
+                                      (new_deadline.isoformat(timespec="seconds"), r["id"]))
+            D.audit(self.conn, "evening.window_recovered", None, evening_id,
+                    {"opens": fresh["opens_at"], "closes": fresh["closes_at"]},
+                    {"opens": new_open.isoformat(timespec="seconds"),
+                     "reason": "backfill after downtime"})
+
+        # The whole read-write-audit sequence runs as ONE blocking unit off the loop.
+        await D.acall(self.conn, _extend)
 
     async def post_evening(self, ev: dict, backfill: bool = False,
                            now: dt.datetime | None = None) -> bool:
@@ -264,9 +281,9 @@ class HubBot(commands.Bot):
             return False
 
         if ev["league"] == "l1":
-            qs = self.conn.execute(
+            qs = await D.acall(self.conn, lambda: self.conn.execute(
                 "SELECT * FROM question WHERE evening_id=? ORDER BY ordinal",
-                (ev["id"],)).fetchall()
+                (ev["id"],)).fetchall())
             if not qs:
                 log.error("evening %s has no questions authored - nothing posted", ev["id"])
                 # NOT opened, NOT consumed: still 'scheduled', so the next tick tries
@@ -284,7 +301,7 @@ class HubBot(commands.Bot):
 
         if backfill:
             await self._extend_window(ev["id"], now)
-        V.open_evening(self.conn, ev["id"], channel.id, None)
+        await D.acall(self.conn, V.open_evening, self.conn, ev["id"], channel.id, None)
         if backfill:
             # Say it out loud. A card that appears hours late with no explanation
             # reads as a broken season; one that says why reads as a server that
@@ -297,9 +314,9 @@ class HubBot(commands.Bot):
         if ev["league"] == "l1":
             for q in qs:
                 opts = json.loads(q["options"])
-                e = ui.question_embed(self.conn, q, ev)
+                e = await D.acall(self.conn, ui.question_embed, self.conn, q, ev)
                 msg = await channel.send(embed=e, view=ui.answer_view(self.conn, q["id"], opts))
-                V.set_question_message(self.conn, q["id"], msg.id)
+                await D.acall(self.conn, V.set_question_message, self.conn, q["id"], msg.id)
                 await channel.send(content="**Staff**",
                                    embed=discord.Embed(description=(
                                        f"Question {q['ordinal']} · tier `{q['tier']}` — "
@@ -307,18 +324,21 @@ class HubBot(commands.Bot):
                                        colour=discord.Colour.dark_grey()),
                                    view=ui.question_grade_view(self.conn, q["id"], len(opts), opts))
         else:
+            prompt = await D.acall(
+                self.conn, D.cfg, self.conn, f"prompt:{ev['day']}:{ev['league']}",
+                "_Staff: post the scenario/hangar card in this thread, then players "
+                "submit below._")
             e = discord.Embed(title=f"{ui.LEAGUE_META[ev['league']][0]} {ev['day']} · "
                                     f"{ev['league'].upper()}",
-                              description=D.cfg(self.conn, f"prompt:{ev['day']}:{ev['league']}",
-                                                "_Staff: post the scenario/hangar card in this "
-                                                "thread, then players submit below._"),
+                              description=prompt,
                               colour=ui.LEAGUE_META[ev["league"]][2])
             e.set_footer(text=f"Window closes <t:{ui._ts(ev['closes_at'])}:F> · "
                               f"one submission, editable until then · {ui.HONESTY_NOTE}")
             msg = await channel.send(embed=e, view=ui.submit_view(self.conn, ev["id"]))
-            self.conn.execute("UPDATE evening SET message_id=? WHERE id=?", (msg.id, ev["id"]))
-        D.audit(self.conn, "evening.autopost", None, ev["id"], None,
-                {"league": ev["league"], "backfill": backfill})
+            await D.acall(self.conn, lambda: self.conn.execute(
+                "UPDATE evening SET message_id=? WHERE id=?", (msg.id, ev["id"])))
+        await D.acall(self.conn, D.audit, self.conn, "evening.autopost", None, ev["id"],
+                      None, {"league": ev["league"], "backfill": backfill})
         return True
 
     async def _tell_staff(self, text: str, evening_id: int | None = None) -> None:
@@ -345,7 +365,7 @@ class HubBot(commands.Bot):
         a night. If /setup has not been run there is no staff channel to shout into,
         so this degrades to the log line above rather than raising inside the loop.
         """
-        chan_id = D.cfg(self.conn, V._hubkey("channel", "staff"))
+        chan_id = await D.acall(self.conn, D.cfg, self.conn, V._hubkey("channel", "staff"))
         if not chan_id:
             return
         try:
@@ -359,9 +379,11 @@ class HubBot(commands.Bot):
         # order matters: a hand-set /setup-channel beats provisioning, which beats
         # the announcements fallback. So /setup works with zero manual wiring, and an
         # owner who points a league somewhere else is never overridden on restart.
-        configured = (D.cfg(self.conn, f"channel:{ev['league']}")
-                       or D.cfg(self.conn, V._hubkey("channel", f"league_{ev['league']}"))
-                       or self.hub_channel_id)
+        def _configured():
+            return (D.cfg(self.conn, f"channel:{ev['league']}")
+                    or D.cfg(self.conn, V._hubkey("channel", f"league_{ev['league']}"))
+                    or self.hub_channel_id)
+        configured = await D.acall(self.conn, _configured)
         if not configured:
             return None
         chan = self.get_channel(configured)
@@ -376,10 +398,10 @@ class HubBot(commands.Bot):
         """Lock the visible state. We only edit the EMBED, never strip the view -
         `message.edit(view=empty)` is rejected by Discord, and stale buttons are
         already harmless because submit_answer checks evening status."""
-        rows = self.conn.execute(
+        rows = await D.acall(self.conn, lambda: self.conn.execute(
             "SELECT q.id, q.message_id, e.channel_id FROM question q "
             "JOIN evening e ON e.id=q.evening_id WHERE q.evening_id=? "
-            "AND q.message_id IS NOT NULL", (evening_id,)).fetchall()
+            "AND q.message_id IS NOT NULL", (evening_id,)).fetchall())
         for r in rows:
             chan = self.get_channel(r["channel_id"])
             if chan is None:
@@ -391,10 +413,14 @@ class HubBot(commands.Bot):
                 # re-render must NEVER be able to break grading or a recovery.
                 continue
             try:
-                q = self.conn.execute("SELECT * FROM question WHERE id=?", (r["id"],)).fetchone()
-                ev = self.conn.execute("SELECT * FROM evening WHERE id=?",
-                                       (evening_id,)).fetchone()
-                await msg.edit(embed=ui.question_embed(self.conn, q, dict(ev)))
+                def _reload():
+                    return (self.conn.execute("SELECT * FROM question WHERE id=?",
+                                              (r["id"],)).fetchone(),
+                            self.conn.execute("SELECT * FROM evening WHERE id=?",
+                                              (evening_id,)).fetchone())
+                q, ev = await D.acall(self.conn, _reload)
+                embed = await D.acall(self.conn, ui.question_embed, self.conn, q, dict(ev))
+                await msg.edit(embed=embed)
             except Exception:                                   # noqa: BLE001
                 pass
 
@@ -458,15 +484,16 @@ def build_tree(bot: HubBot) -> None:
                            f"**{missing}** there. Nothing was changed. Fix it in that "
                            f"channel's *Edit Channel → Permissions*, or pick a channel "
                            f"I can already see, then run this again.")
-        D.set_cfg(bot.hub_conn, "hub_channel_id", channel.id)
-        e = ui.hub_embed(bot.hub_conn)
+        await D.acall(bot.hub_conn, D.set_cfg, bot.hub_conn, "hub_channel_id", channel.id)
+        e = await D.acall(bot.hub_conn, ui.hub_embed, bot.hub_conn)
         try:
             msg = await channel.send(embed=e, view=ui.HubPanelView(bot.hub_conn))
         except discord.Forbidden:
             # A race, or a permission the overwrite calculation cannot see (a channel in a
             # category the bot is denied at server level). Roll the pointer back rather
             # than leave it aimed somewhere unusable.
-            D.set_cfg(bot.hub_conn, "hub_channel_id", bot.hub_channel_id or 0)
+            await D.acall(bot.hub_conn, D.set_cfg, bot.hub_conn, "hub_channel_id",
+                          bot.hub_channel_id or 0)
             return await ui.reply(
                 i, content=f"⚠️ Discord refused the post to {channel.mention} "
                            f"(403 Missing Access) even though my permissions looked "
@@ -500,10 +527,12 @@ def build_tree(bot: HubBot) -> None:
         # correct it is. "Thinking..." is always cheaper than an unanswerable command.
         await i.response.defer(ephemeral=True)
         if mode == "plan":
-            return await ui.reply(i, embed=ui.setup_plan_embed(
-                i, conn, D.cfg(conn, "staff_role_id") or 0))
+            staff = await D.acall(conn, D.cfg, conn, "staff_role_id")
+            embed = await D.acall(conn, ui.setup_plan_embed, i, conn, staff or 0)
+            return await ui.reply(i, embed=embed)
         if mode == "status":
-            return await ui.reply(i, embed=_setup_status(conn, i.guild))
+            embed = await D.acall(conn, _setup_status, conn, i.guild)
+            return await ui.reply(i, embed=embed)
         # NO view.stop() here. It used to be called when a staff role was already stored,
         # on the theory that SETUP would "only re-confirm" it - but stop() is what
         # UNREGISTERS a view from the dispatcher, and discord.py drops the click of any
@@ -543,7 +572,8 @@ def build_tree(bot: HubBot) -> None:
     @app_commands.checks.has_permissions(administrator=True)
     async def setup_channel(i: discord.Interaction, league: app_commands.Choice[str],
                             channel: discord.TextChannel):
-        D.set_cfg(bot.hub_conn, f"channel:{league.value}", channel.id)
+        await D.acall(bot.hub_conn, D.set_cfg, bot.hub_conn, f"channel:{league.value}",
+                      channel.id)
         await i.response.send_message(f"{league.value.upper()} now posts in {channel.mention}.",
                                       ephemeral=True)
 
@@ -563,7 +593,7 @@ def build_tree(bot: HubBot) -> None:
             today = dt.date.today()
             day = (today + dt.timedelta(days=(7 - today.weekday()) % 7 or 7)).isoformat()
         try:
-            res = V.create_season(bot.hub_conn, name, day, weeks)
+            res = await D.acall(bot.hub_conn, V.create_season, bot.hub_conn, name, day, weeks)
         except ValueError as e:
             return await i.response.send_message(f"⚠️ {e}", ephemeral=True)
         nights = res["nights_per_league"]
@@ -589,24 +619,26 @@ def build_tree(bot: HubBot) -> None:
             e = discord.Embed(title="📚 Which night?", colour=0x2f3136,
                               description="Pick the night, then fill the modal. "
                                           "No evening ids, no dates to type.")
-            return await i.response.send_message(embed=e,
-                                                 view=ui.PickNightView(bot.hub_conn, "question"),
-                                                 ephemeral=True)
+            # the picker reads the calendar in its constructor - build it off-loop
+            view = await D.acall(bot.hub_conn, ui.PickNightView, bot.hub_conn, "question")
+            return await i.response.send_message(embed=e, view=view, ephemeral=True)
         if not day:
             return await i.response.send_message(
                 "That needs a `day` (YYYY-MM-DD) — or leave prompt blank and pick the night "
                 "from the list instead.", ephemeral=True)
-        ev = bot.hub_conn.execute("SELECT id FROM evening WHERE day=? AND league=?",
-                                  (day, league)).fetchone()
+        ev = await D.acall(bot.hub_conn, lambda: bot.hub_conn.execute(
+            "SELECT id FROM evening WHERE day=? AND league=?", (day, league)).fetchone())
         if not ev:
             return await i.response.send_message(
                 f"No {league.upper()} night on {day}. Under the rotation L1 plays Mon/Thu/Sun.",
                 ephemeral=True)
         try:
-            res = V.add_question(bot.hub_conn, ev["id"], None, prompt,
-                                 [o.strip() for o in options.split("|") if o.strip()],
-                                 tier=tier,
-                                 points_per_correct=int(points) if points.strip().isdigit() else None)
+            res = await D.acall(bot.hub_conn, V.add_question, bot.hub_conn, ev["id"], None,
+                                prompt,
+                                [o.strip() for o in options.split("|") if o.strip()],
+                                tier=tier,
+                                points_per_correct=(int(points) if points.strip().isdigit()
+                                                    else None))
         except ValueError as e:
             return await i.response.send_message(f"⚠️ {e}", ephemeral=True)
         await i.response.send_message(
@@ -623,12 +655,11 @@ def build_tree(bot: HubBot) -> None:
         if not prompt or not day:
             e = discord.Embed(title="⚔️ Which night?", colour=0x2f3136,
                               description="Pick the night, then write the card in the modal.")
-            return await i.response.send_message(embed=e,
-                                                 view=ui.PickNightView(bot.hub_conn, "prompt"),
-                                                 ephemeral=True)
+            view = await D.acall(bot.hub_conn, ui.PickNightView, bot.hub_conn, "prompt")
+            return await i.response.send_message(embed=e, view=view, ephemeral=True)
         try:
-            res = V.set_scenario_prompt(bot.hub_conn, day, league, prompt,
-                                        actor_id=i.user.id)
+            res = await D.acall(bot.hub_conn, V.set_scenario_prompt, bot.hub_conn, day,
+                                league, prompt, actor_id=i.user.id)
         except ValueError as e:
             return await i.response.send_message(f"⚠️ {e}", ephemeral=True)
         note = ("The bot posts it at 16:00." if not res["posted"]
@@ -641,13 +672,13 @@ def build_tree(bot: HubBot) -> None:
     async def season_preview(i: discord.Interaction, day: str = ""):
         await i.response.defer(ephemeral=True)
         if day:
-            rows = bot.hub_conn.execute(
+            rows = await D.acall(bot.hub_conn, lambda: bot.hub_conn.execute(
                 "SELECT id,league,status,opens_at FROM evening WHERE day=? ORDER BY league",
-                (day,)).fetchall()
+                (day,)).fetchall())
         else:
-            rows = bot.hub_conn.execute(
+            rows = await D.acall(bot.hub_conn, lambda: bot.hub_conn.execute(
                 "SELECT id,league,status,opens_at FROM evening ORDER BY day,league LIMIT 12"
-            ).fetchall()
+            ).fetchall())
         e = discord.Embed(title="Evenings", colour=0x2f3136)
         e.description = "\n".join(f"`{r['id']}` {r['league'].upper()} · {r['status']} · "
                                   f"{r['opens_at'][:16]}" for r in rows) or "*none*"
@@ -665,12 +696,12 @@ def build_tree(bot: HubBot) -> None:
             return await ui.reply(i, content=f"⚠️ I cannot post here: missing "
                                              f"**{missing}** in this channel.")
         try:
-            msg = await i.channel.send(embed=ui.board_embed(bot.hub_conn, "season", None),
-                                       view=ui.BoardView(bot.hub_conn))
+            embed = await D.acall(bot.hub_conn, ui.board_embed, bot.hub_conn, "season", None)
+            msg = await i.channel.send(embed=embed, view=ui.BoardView(bot.hub_conn))
         except discord.Forbidden:
             return await ui.reply(i, content="⚠️ Discord refused the post here "
                                              "(403 Missing Access). Nothing was pinned.")
-        D.set_cfg(bot.hub_conn, f"board:{msg.id}", i.channel.id)
+        await D.acall(bot.hub_conn, D.set_cfg, bot.hub_conn, f"board:{msg.id}", i.channel.id)
         await ui.reply(i, content="📌 Leaderboard pinned here. It updates itself on every "
                                   "award and on season rollover.")
 
@@ -683,14 +714,17 @@ def build_tree(bot: HubBot) -> None:
         if missing:
             return await ui.reply(i, content=f"⚠️ I cannot post here: missing "
                                              f"**{missing}** in this channel.")
-        rows = V.pending_payouts(bot.hub_conn)
-        view = ui.CheckoutView(bot.hub_conn) if rows else ui.no_controls()
+        rows = await D.acall(bot.hub_conn, V.pending_payouts, bot.hub_conn)
+        # CheckoutView reads the payout queue in its constructor, so build it off-loop too.
+        view = (await D.acall(bot.hub_conn, ui.CheckoutView, bot.hub_conn)
+                if rows else ui.no_controls())
         try:
-            msg = await i.channel.send(embed=ui.checkout_embed(bot.hub_conn), view=view)
+            embed = await D.acall(bot.hub_conn, ui.checkout_embed, bot.hub_conn)
+            msg = await i.channel.send(embed=embed, view=view)
         except discord.Forbidden:
             return await ui.reply(i, content="⚠️ Discord refused the post here "
                                              "(403 Missing Access). Nothing was pinned.")
-        D.set_cfg(bot.hub_conn, f"checkout:{msg.id}", i.channel.id)
+        await D.acall(bot.hub_conn, D.set_cfg, bot.hub_conn, f"checkout:{msg.id}", i.channel.id)
         await ui.reply(
             i, content=f"📌 Checkout queue pinned. {len(rows)} row(s) pending. "
                        "The bot never pays: send the coins in-server, then press the "
@@ -700,17 +734,19 @@ def build_tree(bot: HubBot) -> None:
                       description="Turn this season's standings into pending checkouts")
     @app_commands.checks.has_permissions(administrator=True)
     async def queue_payouts(i: discord.Interaction):
-        res = V.queue_payouts(bot.hub_conn)
-        await i.response.send_message(
+        await i.response.defer(ephemeral=True)
+        res = await D.acall(bot.hub_conn, V.queue_payouts, bot.hub_conn)
+        pending = await D.acall(bot.hub_conn, V.pending_count, bot.hub_conn)
+        await i.followup.send(
             f"🧾 {res['created']} checkout(s) queued, {res['skipped']} already existed. "
-            f"{V.pending_count(bot.hub_conn)} pending in total.", ephemeral=True)
+            f"{pending} pending in total.", ephemeral=True)
 
     @bot.tree.command(name="tonight", description="Open tonight's leagues right now")
     @app_commands.checks.has_permissions(administrator=True)
     async def force_tonight(i: discord.Interaction):
         await i.response.defer(ephemeral=True)
         n = 0
-        for ev in V.todays_evenings(bot.hub_conn):
+        for ev in await D.acall(bot.hub_conn, V.todays_evenings, bot.hub_conn):
             if ev["status"] == "scheduled" and await bot.post_evening(ev):
                 n += 1
         await i.followup.send(f"Posted {n} league card set(s) for today." if n
@@ -729,10 +765,10 @@ def build_tree(bot: HubBot) -> None:
     @app_commands.checks.has_permissions(administrator=True)
     async def export(i: discord.Interaction):
         await i.response.defer(ephemeral=True)
-        rows = bot.hub_conn.execute(
+        rows = await D.acall(bot.hub_conn, lambda: bot.hub_conn.execute(
             "SELECT l.day, l.league, l.player_id, l.points, a.reason, a.applied_by, a.ts "
             "FROM ledger l LEFT JOIN award a ON a.player_id=l.player_id "
-            "AND a.evening_id=l.evening_id ORDER BY l.day, l.league, l.points DESC").fetchall()
+            "AND a.evening_id=l.evening_id ORDER BY l.day, l.league, l.points DESC").fetchall())
         csv = "day,league,player_id,points,reason,awarded_by,ts\n" + "\n".join(
             ",".join(str(x) for x in tuple(r)) for r in rows)
         await i.followup.send(file=discord.File(fp=__import__("io").BytesIO(csv.encode()),

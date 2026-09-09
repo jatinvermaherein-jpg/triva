@@ -7,6 +7,7 @@ retry-after-crash cannot award twice. That is the restart-proof guarantee.
 """
 from __future__ import annotations
 
+import asyncio
 import json
 import re
 import sqlite3
@@ -881,14 +882,48 @@ _TABLE_RE = re.compile(r"^\s*(?:UPDATE\s+|DELETE\s+FROM\s+)(" + _NAME + r")", re
 _SET_RE = re.compile(r"\bSET\b(.*?)\bWHERE\b", re.I | re.S)
 
 
+def _pg_connect(psycopg_mod, conninfo: str):
+    """The ONE place a Postgres connection is opened (boot and reconnect both).
+
+    The extra keywords are the difference between a bot that survives a flaky WAN link
+    and one that freezes:
+      * connect_timeout=10  - without it a reconnect can sit in psycopg.connect() for the
+        OS TCP timeout (two minutes and change). While that runs, the gateway heartbeat
+        stops and Discord drops the shard.
+      * keepalives          - Supabase's pooler hangs up idle sessions, and a dead TCP
+        connection is invisible until you write to it. With the OS defaults the next
+        statement then blocks for ~2 HOURS before noticing; with these values a dead
+        link is detected in about a minute and the reconnect path heals it.
+    Keyword arguments win over anything the pasted conninfo already carries, so the
+    safety net applies even to a URI that omits (or mis-spells) these settings.
+    """
+    return psycopg_mod.connect(conninfo,
+                               row_factory=psycopg_mod.rows.dict_row,
+                               autocommit=True,
+                               prepare_threshold=None,
+                               application_name="hub-knowledge-season",
+                               connect_timeout=10,
+                               keepalives=1,
+                               keepalives_idle=30,
+                               keepalives_interval=10,
+                               keepalives_count=3)
+
+
 class PgConnection:
     """One Postgres connection, shaped like sqlite3.Connection.
 
     A single connection behind an RLock, because `with conn:` nests at 23 call sites and the
-    20-second scheduler tick shares the process with interaction handlers. Queries run in the
-    same region as the bot, so a statement costs milliseconds, and the write volume here (a
-    few hundred grading writes on a busy night for 200 players) cannot starve a gateway. If
-    that ever changes, this class is the only seam that needs a pool.
+    20-second scheduler tick shares the process with interaction handlers. Every statement
+    funnels through execute() under that lock, which is also what makes it safe for acall()
+    to run blocking calls from several worker threads at once: a `with conn:` block is atomic
+    with respect to every other user of the connection.
+
+    This class does NOT decide where statements run. On the event loop a stuck network read
+    blocks the gateway heartbeat - "heartbeat blocked for more than 10 seconds", then a dead
+    shard - so the async surface of the bot routes every call through db.acall(), which moves
+    it to a worker thread on this backend. The lock plus prepare_threshold=None (server-side
+    prepared statements would collide between sessions under the pooler) are what keep a
+    shared connection correct there.
     """
 
     def __init__(self, conninfo: str):
@@ -910,10 +945,8 @@ class PgConnection:
             # the server, outlive our process, and collide: "prepared statement _pg3_0
             # already exists", on the very first query after a restart. None is the only
             # value that disables them; client-side binds then survive pooling fine.
-            self._c = psycopg.connect(conninfo, autocommit=True,
-                                       row_factory=psycopg.rows.dict_row,
-                                       prepare_threshold=None,
-                                       application_name="hub-knowledge-season")
+            # _pg_connect adds connect_timeout + TCP keepalives on top of that.
+            self._c = _pg_connect(psycopg, conninfo)
         except Exception as exc:
             msg = str(exc).strip()
             hint = ""
@@ -1122,10 +1155,14 @@ class PgConnection:
         working (it turns the insert into an UPDATE); without this it would answer "interaction
         failed" and lose the edit. Wrapping each in-transaction statement in a savepoint and
         rolling back to it restores a usable transaction, exactly SQLite's behaviour.
+
+        Takes the lock: the rollback runs on the shared connection, and execute() has already
+        released it by the time this fires.
         """
         if self._depth and self._sp:
             try:
-                self._c.execute("ROLLBACK TO SAVEPOINT sp" + str(self._sp))
+                with self._lock:
+                    self._c.execute("ROLLBACK TO SAVEPOINT sp" + str(self._sp))
             except self._psycopg.Error:
                 pass
 
@@ -1136,20 +1173,23 @@ class PgConnection:
         but a 20-second restart gap during a night costs the opening post, and Supabase's
         pooler does idle-drop. Cheap to do here because every statement funnels through
         execute(); outside a `with conn:` block, so a retry cannot duplicate half a transaction.
+
+        Takes the lock itself: since acall() runs statements from worker threads, two
+        callers can discover the dead connection at the same instant, and a double
+        reconnect would leak one of the two sessions. RLock, so a caller that already
+        holds it (execute) re-enters for free.
         """
-        try:
-            if not self._c.closed:
+        with self._lock:
+            try:
+                if not self._c.closed:
+                    return False
+            except self._psycopg.Error:
                 return False
-        except self._psycopg.Error:
-            return False
-        try:
-            self._c = self._psycopg.connect(self._conninfo, autocommit=True,
-                                            row_factory=self._psycopg.rows.dict_row,
-                                            prepare_threshold=None,
-                                            application_name="hub-knowledge-season")
-            return True
-        except self._psycopg.Error:
-            return False
+            try:
+                self._c = _pg_connect(self._psycopg, self._conninfo)
+                return True
+            except self._psycopg.Error:
+                return False
 
     def execute(self, sql, params=None):
         # Deliberately NOT `params or ()`: psycopg only inspects the query for placeholders
@@ -1161,10 +1201,13 @@ class PgConnection:
         params = self._coerce(sql2, table, cols, params)
         cur = None
         guard = bool(self._depth)
-        if not guard:
-            self._ensure_conn()
         try:
+            # One locked region: reconnect, savepoint, statement and result buffering are
+            # atomic with respect to every other thread acall() may be running. RLock, so
+            # _ensure_conn re-enters when execute already holds it.
             with self._lock:
+                if not guard:
+                    self._ensure_conn()
                 if guard:
                     self._sp += 1
                     self._c.execute("SAVEPOINT sp" + str(self._sp))
@@ -1278,3 +1321,35 @@ class PgConnection:
 
     def __repr__(self):
         return "<PgConnection tables=" + str(len(self._tables)) + ">"
+
+
+# ---------------------------------------------------------------------------
+# The async seam.
+#
+# Every statement on the Postgres backend is a round trip over a WAN socket, so a
+# synchronous call issued from the asyncio loop STALLS the loop whenever the server,
+# the pooler or the link does. That is the failure the deploy log records as
+# "heartbeat blocked for more than 10 seconds": the gateway cannot heartbeat while
+# the loop sits in psycopg's socket wait, and Discord drops a shard that goes quiet.
+# acall() is the one rule that prevents it: async code never calls a blocking database
+# function directly, it awaits it through here, and the call runs in a worker thread.
+#
+# PgConnection is the only class that needs this: a SQLite file is local disk, costs
+# microseconds and cannot stall behind a network, so it stays inline (which also keeps
+# the offline test suites single-threaded). Transactions keep their shape either way -
+# a `with conn:` block passed in as part of `fn` still enters and exits on ONE thread,
+# and PgConnection's RLock serialises concurrent workers, so nothing interleaves.
+# ---------------------------------------------------------------------------
+
+async def acall(conn, fn, *args, **kwargs):
+    """`fn(*args, **kwargs)` without blocking the event loop.
+
+    `conn` decides the strategy: the Postgres facade runs `fn` in a worker thread;
+    any other connection object (a sqlite3.Connection, a test fake) runs it inline.
+    Exceptions raised by `fn` propagate to the awaiter unchanged, so existing
+    `except ValueError` / `except db.IntegrityError` clauses at the call sites keep
+    working on both backends.
+    """
+    if isinstance(conn, PgConnection):
+        return await asyncio.to_thread(fn, *args, **kwargs)
+    return fn(*args, **kwargs)

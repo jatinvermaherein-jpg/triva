@@ -1,6 +1,67 @@
 # Build status — v4.0 refactor
 
-## 2026-09-09 (newest) — the picker answered too late, and never disabled itself
+## 2026-09-09 (newest) — heartbeat blocked: the event loop was waiting on Postgres
+
+```
+13:34:26  WARNING discord.gateway: Shard ID None heartbeat blocked for more than 10 seconds.
+13:34:29  Loop thread traceback (most recent call last):
+            File "/app/bot/ui.py", line 449, in run
+              res = await V.provision(self.conn, _GuildWorkspace(i.guild, self.conn), ...
+            File "/app/bot/services.py", line 273, in provision
+              dbmod.set_cfg(conn, key, value)
+            File "/app/bot/db.py", line 1174, in execute
+              self._c.execute("RELEASE SAVEPOINT sp" + str(self._sp))
+            File psycopg/connection.py ... waiting.wait(gen, self.pgconn.socket, ...)
+```
+
+Logged in fine at 13:20, first real work at 13:34 (`/setup` → "Create everything"), and the
+loop thread dump shows exactly where the bot was stuck: **synchronously waiting on a Postgres
+socket, on the asyncio event loop**. The facade kept its sqlite3-shaped synchronous API (that
+is why 144 call sites survived the move to Supabase untouched), and the docstring's bet was
+"queries run in the same region as the bot, so a statement costs milliseconds". The 13:34
+statement cost more than ten *seconds* — a pooler hiccup, a dead TCP link, any WAN stall —
+and while the loop sits in psycopg's socket wait the gateway cannot heartbeat, so Discord
+drops a shard that goes quiet. Every button, every tick, every answer died with it.
+
+The previous entry named this as the next failure and said what the real fix had to be: "move
+that work off the event loop, not merely behind a defer". Done, in two parts:
+
+**1. `db.acall()` — the async seam.** Async code may no longer call a blocking database
+function directly; it awaits it through `acall(conn, fn, *args)`, which runs `fn` in a worker
+thread when the backend is `PgConnection` and inline for a local SQLite file (microseconds,
+no network, and the offline suites stay single-threaded). Every async surface was converted:
+the scheduler (`tick`, `backfill`, `_extend_window`, `post_evening`, card re-edits, channel
+resolution), every slash command, every button/modal callback in `ui.py` (player answers,
+grading, awards, checkouts, panels, season end), the permission gate's config read, and the
+three async services (`provision`, `finalize_season`, `_apply_roles`), including the
+`with conn:` write-back blocks, which stay ONE transaction on ONE thread. Exceptions propagate
+unchanged, so the duplicate-answer `except IntegrityError` paths still work; `PgConnection`'s
+RLock now also guards `_ensure_conn` and `_heal`, which used to touch the shared connection
+unlocked and would have raced the new worker threads.
+
+**2. The stall itself is bounded.** `_pg_connect()` is the one place a connection is opened
+(boot *and* reconnect — the reconnect path used to be a second, divergence-prone
+`psycopg.connect` call). It adds `connect_timeout=10` (a reconnect could otherwise sit for the
+OS TCP timeout, ~2 minutes) and TCP keepalives on a ~1-minute fuse (`keepalives_idle=30,
+interval=10, count=3`): Supabase's pooler hangs up idle sessions, and without keepalives the
+next statement on a dead link blocks for ~2 HOURS before the OS notices. kwargs override
+anything a pasted conninfo carries, so the safety net applies to every HUB_DB shape.
+
+Verified: new `tests/test_async_seam.py` (12 checks, registered in run_tests.py): the
+keepalive/timeout kwargs reach `psycopg.connect`; `acall` runs Postgres-shaped work off the
+loop thread and SQLite inline; worker exceptions reach the awaiter unchanged; and the property
+the incident is about — with a simulated 1-second stalled statement, a heartbeat task through
+`acall` keeps beating (≥10 ticks), while the same stall run inline freezes the loop (≤2
+ticks, the old behaviour, kept as the negative control). All 8 suites green, no Postgres
+server needed.
+
+**Left open, noted:** a *server-side* slow query still holds its worker thread until the
+keepalives fire or it finishes; nothing here can cancel it. If that ever matters, the seam is
+the place a statement timeout or a pool would go — `db.acall`/`PgConnection` only, no call
+site changes.
+
+
+## 2026-09-09 (previous) — the picker answered too late, and never disabled itself
 
 ```
 09:30:36  registered 11 persistent views; 0 evenings pending
