@@ -74,10 +74,13 @@ class Resp:
     Verified against 2.7.1: send_message / edit_message / send_modal / defer /
     is_done / pong / autocomplete / launch_activity."""
 
-    def __init__(self): self.sent = []; self.edited = []; self.modals = []
+    def __init__(self): self.sent = []; self.edited = []; self.modals = []; self.deferred = []
     def is_done(self):        # a METHOD on discord.py's InteractionResponse, not a property
-        return bool(self.sent or self.edited or self.modals)
-    async def defer(self, **kw): pass
+        # A deferred reply counts as done (2.7.1: `_responded` is set by defer()), which is
+        # the fork ui.reply takes - so a callback that defers first must be answered by
+        # edit_original_response, and a fake that said otherwise would hide that bug.
+        return bool(self.sent or self.edited or self.modals or self.deferred)
+    async def defer(self, **kw): self.deferred.append(kw)
     async def send_message(self, content=None, **kw): self.sent.append((content, kw))
     async def edit_message(self, **kw): self.edited.append(kw)
     async def send_modal(self, modal): self.modals.append(modal)
@@ -102,6 +105,11 @@ class FakeInteraction:
         self.channel = channel
         self.guild = None
         self.followup = _Followup()
+        self.edits = []
+
+    async def edit_original_response(self, **kw):
+        """What ui.reply calls once the response is spent (deferred, or already sent)."""
+        self.edits.append(kw)
 
 # --- 1. persistence -------------------------------------------------------- #
 check("every view is registered for persistence", len(ui.PERSISTENT_VIEWS) >= 6,
@@ -950,5 +958,146 @@ check("a failing control is written to the log instead of vanishing",
 check("…and the user is told, through the path that survives an already-used token",
       len(_di.edits) == 1 and "failed" in str(_di.edits[0].get("content")), str(_di.edits))
 
+# --------------------------------------------------------------------------- #
+# modals acknowledge BEFORE they touch the database
+#
+# The deploy log's second failure: `404 (10062) Unknown interaction` from a modal's
+# on_submit. Deferring is not what fixed the heartbeat stall (that was db.acall), it is
+# the OTHER half - Discord gives an interaction 3 seconds, and a modal whose answer
+# needs 120 WAN round trips cannot make that. These two modals were the ones doing the
+# most work before answering, and neither had a test at all.
+# --------------------------------------------------------------------------- #
+
+class _SeqConn:
+    """Records whether the interaction was already acknowledged at each DB touch.
+
+    Delegates everything, so the service layer sees a real connection; the only thing it
+    adds is the ordering fact the tests assert on. isinstance() still says "not a
+    PgConnection", so db.acall runs inline here and the test stays single-threaded.
+    """
+
+    def __init__(self, real, seen):
+        self._real, self._seen = real, seen
+
+    def __getattr__(self, name):
+        return getattr(self._real, name)
+
+    def execute(self, *a, **kw):
+        self._seen.append("db")
+        return self._real.execute(*a, **kw)
+
+    def __enter__(self):
+        self._seen.append("db")
+        return self._real.__enter__()
+
+    def __exit__(self, *exc):
+        return self._real.__exit__(*exc)
+
+
+class _AckTracker(FakeInteraction):
+    """Notes 'ack' when the response is deferred, 'db' on every statement.
+
+    The defer goes through `interaction.response`, so the recorder has to live there -
+    a plain override of FakeInteraction.defer would never be reached, and the check
+    would pass on a modal that answered inside the 3-second window by luck.
+    """
+    def __init__(self, *a, **kw):
+        super().__init__(*a, **kw)
+        self.order = []
+        tracker = self
+
+        class _Resp(Resp):
+            async def defer(self, **kw):
+                await super().defer(**kw)
+                tracker.order.append("ack")
+
+        self.response = _Resp()
+
+
+def _tracked(modal_cls, conn, *args, user_id=1, **values):
+    """Submit a modal over an instrumented connection; return (interaction, order)."""
+    i = _AckTracker(user_id=user_id)
+    modal = modal_cls(_SeqConn(conn, i.order), *args)
+    submit_modal(modal, i, **values)
+    return i, i.order
+
+
+ans_ev = conn.execute("SELECT * FROM evening WHERE day='2026-09-15' AND league='l2'").fetchone()
+V.open_evening(conn, ans_ev["id"], 77, 1)
+_i, _order = _tracked(ui.AnswerModal, conn, ans_ev["id"], user_id=77,
+                      answer="1) Yagorath, fast rotate  2) push the left lane early "
+                             "3) their flank overextends, so I swap  4) I save ult for "
+                             "the second fight, not the first")
+check("the answer modal acknowledges before its first database statement",
+      _order and _order[0] == "ack" and "db" in _order, str(_order[:4]))
+check("…so the answer lands in the deferred placeholder, not a fresh 3-second reply",
+      _i.response.deferred and len(_i.edits) == 1 and not _i.response.sent,
+      f"deferred={_i.response.deferred} edits={_i.edits} sent={_i.response.sent}")
+check("and the confirmation is the real one",
+      "recorded" in str(_i.edits[0].get("content")), str(_i.edits))
+check("the submission itself was saved",
+      conn.execute("SELECT COUNT(*) c FROM submission WHERE evening_id=? AND player_id=77",
+                   (ans_ev["id"],)).fetchone()["c"] == 1, "")
+
+
+class _Expired(FakeInteraction):
+    """Acknowledged in time, but the token died before the answer - the 10062 case."""
+    async def edit_original_response(self, **kw):
+        raise _not_found()
+
+
+_ie = _Expired()
+submit_modal(ui.AnswerModal(conn, ans_ev["id"]), _ie,
+             answer="1) Orion  2) take the middle in the first ten seconds "
+                    "3) nothing breaks if I keep moving  4) I bait the ult then push")
+check("a lost confirmation does not raise out of the modal (the 10062 in the log)",
+      True, "reply() swallowed the NotFound")
+check("…and the player's answer was still saved",
+      conn.execute("SELECT COUNT(*) c FROM submission WHERE evening_id=? AND player_id=1",
+                   (ans_ev["id"],)).fetchone()["c"] == 1, "")
+
+_ie2 = _Expired()
+try:
+    asyncio.run(ui.AnswerModal(conn, ans_ev["id"]).on_error(_ie2, ValueError("disk")))
+    _on_error_ok = True
+except Exception as exc:                                  # noqa: BLE001 - the point of the check
+    _on_error_ok = False
+    print("   on_error raised:", exc)
+check("on_error survives the used token too (it used to re-raise 404 over the real error)",
+      _on_error_ok, "")
+
+_is, _sorder = _tracked(ui.SeasonCreateModal, conn,
+                        name="Season 9", start_day="2026-11-02", weeks="4")
+# Counted, not assumed: on this schema a 4-week season is 43 statements (1 season +
+# 36 evenings + 3 balance counts + audit). On Postgres every one of those is a WAN
+# round trip, which is why answering inside the 3-second window was never possible.
+_n = _sorder.count("db")
+check("the season modal acknowledges before it starts building the calendar",
+      _sorder and _sorder[0] == "ack" and _n >= 40,
+      f"first={_sorder[:2]} db_statements={_n} of {len(_sorder)} events")
+check("the confirmation reports the real calendar",
+      _is.edits and "Season 9" in str(_is.edits[0].get("content"))
+      and "36 evenings" in str(_is.edits[0].get("content"))
+      and "12 nights" in str(_is.edits[0].get("content")), str(_is.edits))
+_per = {r["league"]: r["c"] for r in conn.execute(
+    "SELECT league, COUNT(*) c FROM evening WHERE season_id=? GROUP BY league",
+    (conn.execute("SELECT id FROM season WHERE name='Season 9'").fetchone()["id"],))}
+check("and the season really is balanced across the three leagues",
+      _per == {"l1": 12, "l2": 12, "l3": 12}, str(_per))
+
+_it = FakeInteraction()
+submit_modal(ui.SeasonCreateModal(conn), _it, name="Bad", start_day="2026-99-99", weeks="4")
+check("a typo is answered immediately, with no deferral and no season created",
+      not _it.response.deferred and _it.response.sent
+      and "valid date" in _it.response.sent[0][0]
+      and conn.execute("SELECT COUNT(*) c FROM season WHERE name='Bad'").fetchone()["c"] == 0,
+      f"deferred={_it.response.deferred} sent={_it.response.sent}")
+
+_isx = _Expired()
+submit_modal(ui.SeasonCreateModal(conn), _isx, name="Season 10",
+             start_day="2027-01-04", weeks="2")
+check("a season whose confirmation 404s still exists afterwards (nothing is lost)",
+      conn.execute("SELECT COUNT(*) c FROM season WHERE name='Season 10'").fetchone()["c"] == 1,
+      "")
 
 print(f"\n{ok} UI checks passed.")

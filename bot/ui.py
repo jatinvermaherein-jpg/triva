@@ -648,22 +648,33 @@ class AnswerModal(discord.ui.Modal, title="Your answer"):
                     "3) what breaks it + the switch  4) one thing they won't expect")
 
     async def on_submit(self, interaction: discord.Interaction):
+        # Acknowledge BEFORE touching the database, and answer through reply().
+        # create_submission is several WAN round trips (duplicate scan, insert, audit);
+        # on a cross-region Supabase link that is longer than Discord's 3-second
+        # interaction window, after which EVERY way of answering raises
+        # 404 (10062) Unknown interaction - including from inside on_error, which is
+        # how the player loses both their answer and the explanation. The database
+        # write still happens either way; deferring only buys the time to report it.
+        await interaction.response.defer(ephemeral=True)
         res = await V.dbmod.acall(self.conn, V.create_submission, self.conn,
                                   self.evening_id, interaction.user.id, self.answer.value)
         if not res["accepted"]:
-            return await interaction.response.send_message(res["message"], ephemeral=True)
+            return await reply(interaction, content=res["message"])
         notes = [f"✅ {res['word_count']} words",
                  "re-updated" if res["rework"] else "recorded"]
         if res.get("duplicate_of"):
             notes.append("⚠️ very similar to another entry tonight — staff may ask you "
                          "to explain it in a ticket")
-        await interaction.response.send_message(
-            " · ".join(notes) + "\nPoints are posted after the deadline; the leaderboard "
-            "updates itself.\n*" + HONESTY_NOTE + "*", ephemeral=True)
+        await reply(interaction,
+                    content=" · ".join(notes) + "\nPoints are posted after the deadline; "
+                            "the leaderboard updates itself.\n*" + HONESTY_NOTE + "*")
 
     async def on_error(self, interaction, error):
-        await interaction.response.send_message(f"⚠️ Could not save: `{error}`",
-                                                ephemeral=True)
+        # reply(), not response.send_message: on_submit deferred first, so the response
+        # is already spent and a second send_message would raise InteractionResponded -
+        # and if the window closed instead, it would raise the very 404 this is meant
+        # to explain. reply() edits the deferred placeholder and swallows both.
+        await reply(interaction, content=f"⚠️ Could not save: `{error}`")
 
 
 # --------------------------------------------------------------------------- #
@@ -1210,14 +1221,26 @@ class SeasonCreateModal(discord.ui.Modal, title="Create a Hub season"):
             else:
                 today = dt.date.today()
                 day = (today + dt.timedelta(days=(7 - today.weekday()) % 7 or 7)).isoformat()
+            # Acknowledge BEFORE the calendar is built, and answer through reply().
+            # Everything above is pure local validation - it costs nothing and keeps the
+            # typo answers instant. create_season is the expensive part: measured on this
+            # repo's own code path, a 4-week season is 43 statements (1 season row + 36
+            # evening rows + 3 balance counts + an audit row), and inside the `with conn:`
+            # block each one also takes and releases a savepoint, so the Postgres backend
+            # issues ~120 round trips. On a cross-region Supabase link that is seconds -
+            # well past Discord's 3-second interaction window, after which the answer 404s
+            # with (10062) Unknown interaction and the season exists anyway with nobody
+            # told. acall already keeps it off the event loop; deferring is what makes the
+            # confirmation actually arrive.
+            await interaction.response.defer(ephemeral=True)
             res = await V.dbmod.acall(self.conn, V.create_season, self.conn, name, day, weeks)
         except (ValueError, TypeError, V.dbmod.IntegrityError) as exc:
-            return await interaction.response.send_message(
-                f"⚠️ Use a valid date and a whole number of weeks from 1 to 8, "
-                f"and choose a new season name. ({exc})", ephemeral=True)
-        await interaction.response.send_message(
-            f"📅 **{name}** created: {res['evenings']} evenings from {day}. "
-            f"Each league has {res['nights_per_league']['l1']} nights.", ephemeral=True)
+            return await reply(interaction,
+                               content=f"⚠️ Use a valid date and a whole number of weeks "
+                                       f"from 1 to 8, and choose a new season name. ({exc})")
+        await reply(interaction,
+                    content=f"📅 **{name}** created: {res['evenings']} evenings from {day}. "
+                            f"Each league has {res['nights_per_league']['l1']} nights.")
 
 
 class ChannelWireSelect(discord.ui.ChannelSelect):
