@@ -188,7 +188,7 @@ from public.ks_challenges c
 join public.ks_slots sl on sl.id = c.slot_id
 join public.ks_seasons se on se.id = sl.season_id;
 
--- Knowledge results remain absent from public standings until closing.
+-- Trivia results remain absent from public standings until closing.
 -- First-correct bonus is derived, not permanently attached to a user.
 -- Disqualifying the first correct answer moves the bonus automatically.
 
@@ -336,7 +336,7 @@ begin
 
   if p_kind = 'trivia' then
     if c.league <> 'knowledge' then
-      raise exception 'Not a Knowledge question';
+      raise exception 'Not a Trivia question';
     end if;
 
     v_choice := (p_payload->>'choice')::integer;
@@ -520,7 +520,7 @@ begin
   if c.league = 'knowledge'
     and p_score <> coalesce(a.score, 0)
   then
-    raise exception 'Knowledge base scores are derived from the answer key';
+    raise exception 'Trivia base scores are derived from the answer key';
   end if;
 
   if length(btrim(coalesce(p_reason, ''))) = 0 then
