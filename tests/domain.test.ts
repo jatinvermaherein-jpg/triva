@@ -6,6 +6,7 @@ import {
   compareStanding,
   makeSlots,
   nextMondayIST,
+  normalizeSupabaseUrl,
   validateSections,
   wordCount
 } from "../src/domain.js";
@@ -130,4 +131,31 @@ test("exact ties remain ties", () => {
   };
 
   assert.equal(compareStanding(row, row), 0);
+});
+
+test("SUPABASE_URL is the project origin, not the REST path", () => {
+  assert.equal(
+    normalizeSupabaseUrl("https://abc.supabase.co"),
+    "https://abc.supabase.co"
+  );
+  assert.equal(
+    normalizeSupabaseUrl("https://abc.supabase.co/"),
+    "https://abc.supabase.co"
+  );
+  assert.equal(
+    normalizeSupabaseUrl("https://abc.supabase.co/rest/v1"),
+    "https://abc.supabase.co"
+  );
+  assert.equal(
+    normalizeSupabaseUrl("https://abc.supabase.co/rest/v1/"),
+    "https://abc.supabase.co"
+  );
+  assert.equal(
+    normalizeSupabaseUrl(' "https://abc.supabase.co/rest/v1/" '),
+    "https://abc.supabase.co"
+  );
+  assert.throws(
+    () => normalizeSupabaseUrl("postgresql://postgres@localhost/postgres"),
+    /https Project URL/
+  );
 });

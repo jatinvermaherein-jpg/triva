@@ -127,6 +127,40 @@ export function chunks(text: string, size = 1750): string[] {
   return output.length ? output : ["—"];
 }
 
+/**
+ * People often paste the REST endpoint, a trailing slash, or a postgres URI
+ * into SUPABASE_URL. PostgREST then sees an extra path segment and returns
+ * PGRST125 "Invalid path specified in request URL".
+ */
+export function normalizeSupabaseUrl(raw: string): string {
+  const value = raw.trim().replace(/^['"]+|['"]+$/g, "");
+
+  let url: URL;
+  try {
+    url = new URL(value);
+  } catch {
+    throw new Error(
+      "SUPABASE_URL is not a valid URL. Use the Project URL from " +
+      "Supabase Settings → API, e.g. https://YOUR_PROJECT.supabase.co"
+    );
+  }
+
+  if (url.protocol !== "https:" && url.protocol !== "http:") {
+    throw new Error(
+      "SUPABASE_URL must be the https Project URL from Supabase " +
+      "Settings → API, not a postgres:// connection string."
+    );
+  }
+
+  url.pathname = url.pathname
+    .replace(/\/+$/g, "")
+    .replace(/\/(rest|auth|storage|functions)\/v1$/i, "");
+  url.search = "";
+  url.hash = "";
+
+  return `${url.origin}${url.pathname}`.replace(/\/+$/g, "");
+}
+
 export function imageMime(buffer: Buffer): string | null {
   if (
     buffer.length >= 8 &&
