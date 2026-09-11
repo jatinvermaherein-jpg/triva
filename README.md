@@ -18,6 +18,7 @@ Rewards (per league, per season): 1st 3,000 · 2nd 2,000 · 3rd 1,000 · 4th 800
 ├── package.json
 ├── tsconfig.json
 ├── .env.example
+├── .dockerignore
 ├── railway.json
 ├── sql/
 │   └── 001_initial.sql     schema, derived-scoring views, transactional rules
