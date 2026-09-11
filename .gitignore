@@ -1,25 +1,12 @@
-# The season lives in the database. It is server state, never source: committing
-# it would publish player ids, submissions and the audit trail, and every deploy
-# would fight over it.
-*.db
-*.db-wal
-*.db-shm
-*.db-journal
-*.sqlite
-*.sqlite3
-
-__pycache__/
-*.pyc
-.pytest_cache/
-.pytest_tmp/          # the suites' scratch databases; untracked but easy to `git add -A`
-hub.db                 # running --check from a checkout drops this in the repo root
-.venv/
-venv/
-.mypy_cache/
-.ruff_cache/
-.DS_Store
+node_modules/
+dist/
 
 # local-only secrets, in case someone runs the bot from a checkout
 .env
 .env.*
+!.env.example
 *.token
+
+.DS_Store
+npm-debug.log*
+*.log
