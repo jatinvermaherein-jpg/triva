@@ -38,13 +38,14 @@ import {
   imageMime,
   makeSlots,
   nextMondayIST,
+  normalizeSupabaseUrl,
   validateSections,
   wordCount,
   type League
 } from "./domain.js";
 
 function env(name: string): string {
-  const value = process.env[name];
+  const value = process.env[name]?.trim();
   if (!value) throw new Error(`Missing environment variable: ${name}`);
   return value;
 }
@@ -56,8 +57,10 @@ const GUILD_ID = env("DISCORD_GUILD_ID");
 const BUCKET =
   process.env.SUPABASE_UPLOAD_BUCKET ?? "knowledge-uploads";
 
+const SUPABASE_URL = normalizeSupabaseUrl(env("SUPABASE_URL"));
+
 const supabase = createClient(
-  env("SUPABASE_URL"),
+  SUPABASE_URL,
   env("SUPABASE_SERVICE_ROLE_KEY"),
   {
     auth: {
@@ -84,9 +87,42 @@ let shuttingDown = false;
 
 const imageLocks = new Set<string>();
 
+function dbErrorMessage(error: any): string {
+  const parts = [error?.message ?? "Unknown database error"];
+  if (error?.code) parts.push(`code=${error.code}`);
+  if (error?.hint) parts.push(error.hint);
+  if (error?.details) parts.push(error.details);
+
+  const text = parts.filter(Boolean).join(" — ");
+
+  if (
+    error?.code === "PGRST125" ||
+    /invalid path specified in request url/i.test(text)
+  ) {
+    return (
+      `${text}. SUPABASE_URL must be the Project URL ` +
+      `(https://YOUR_PROJECT.supabase.co), not /rest/v1 or a postgres:// URI. ` +
+      `Using ${SUPABASE_URL}`
+    );
+  }
+
+  return text;
+}
+
+function isMissingSchemaError(error: any): boolean {
+  const text = `${error?.message ?? ""} ${error?.code ?? ""} ${error?.hint ?? ""}`;
+  return (
+    /PGRST205/.test(text) ||
+    /42P01/.test(text) ||
+    /could not find the table/i.test(text) ||
+    /schema cache/i.test(text) ||
+    /relation .* does not exist/i.test(text)
+  );
+}
+
 async function db(query: PromiseLike<any>): Promise<any> {
   const { data, error } = await query;
-  if (error) throw new Error(error.message);
+  if (error) throw new Error(dbErrorMessage(error));
   return data;
 }
 
@@ -95,13 +131,41 @@ async function rpc(name: string, args: Record<string, unknown>) {
 }
 
 async function loadConfig() {
-  config = await db(
-    supabase.from("ks_config")
-      .select("*")
-      .eq("guild_id", GUILD_ID)
-      .maybeSingle()
-  );
+  try {
+    config = await db(
+      supabase.from("ks_config")
+        .select("*")
+        .eq("guild_id", GUILD_ID)
+        .maybeSingle()
+    );
+  } catch (error: any) {
+    if (isMissingSchemaError(error)) {
+      console.error(
+        "[config] ks_config is missing. Run sql/001_initial.sql " +
+        "in the Supabase SQL editor before /setup."
+      );
+      config = null;
+      return config;
+    }
+    throw error;
+  }
   return config;
+}
+
+async function requireDatabase() {
+  try {
+    await db(
+      supabase.from("ks_config").select("guild_id").limit(1)
+    );
+  } catch (error: any) {
+    if (isMissingSchemaError(error)) {
+      throw new Error(
+        "The Knowledge Season tables are missing. Run sql/001_initial.sql " +
+        "in the Supabase SQL editor, then try /setup again."
+      );
+    }
+    throw error;
+  }
 }
 
 async function guild() {
@@ -511,6 +575,8 @@ async function ensureSeasons() {
 }
 
 async function setupServer(staffRoleId: string) {
+  await requireDatabase();
+
   const g = await guild();
   const me = await g.members.fetchMe();
 
@@ -3261,8 +3327,13 @@ client.on(Events.InteractionCreate, async (i: any) => {
   }
 });
 
+client.on(Events.Error, error => {
+  console.error("[discord]", error);
+});
+
 client.once(Events.ClientReady, async () => {
   console.log(`Logged in as ${client.user!.tag}`);
+  console.log(`Supabase host: ${new URL(SUPABASE_URL).host}`);
 
   const commands = [
     new SlashCommandBuilder()
@@ -3277,16 +3348,30 @@ client.once(Events.ClientReady, async () => {
 
   const rest = new REST({ version: "10" }).setToken(TOKEN);
 
-  await rest.put(
-    Routes.applicationGuildCommands(APP_ID, GUILD_ID),
-    { body: commands.map(c => c.toJSON()) }
-  );
+  try {
+    await rest.put(
+      Routes.applicationGuildCommands(APP_ID, GUILD_ID),
+      { body: commands.map(c => c.toJSON()) }
+    );
+  } catch (error) {
+    console.error("[ready] Failed to register slash commands:", error);
+  }
 
-  await loadConfig();
+  try {
+    await loadConfig();
 
-  if (config) await ensureSeasons();
+    if (config) await ensureSeasons();
 
-  await tick();
+    await tick();
+  } catch (error) {
+    console.error("[ready] Database startup failed:", error);
+    console.error(
+      "The bot will stay online so /setup can run. " +
+      "Confirm SUPABASE_URL is the Project URL " +
+      "(https://YOUR_PROJECT.supabase.co) and that sql/001_initial.sql " +
+      "has been applied."
+    );
+  }
 
   setInterval(
     () => void tick(),
