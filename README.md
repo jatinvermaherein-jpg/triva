@@ -1,12 +1,12 @@
-# Hub Knowledge — Discord Knowledge Season bot
+# Hub Trivia — Discord Trivia Season bot
 
-TypeScript + discord.js + Supabase bot running a four-week Mech Arena knowledge competition.
+TypeScript + discord.js + Supabase bot running a four-week Mech Arena trivia competition.
 
 Three independent leagues run Monday–Saturday, opening 4 PM IST, each question open 24 hours:
 
 | League | Format | Scoring |
 | --- | --- | --- |
-| 🧠 Knowledge | Private multiple choice, one final answer | 1–10 points from the answer key, +1 for first correct |
+| 🧠 Trivia | Private multiple choice, one final answer | 1–10 points from the answer key, +1 for first correct |
 | ⚔️ Strategy | Long answer, saved drafts, edits until closing | Staff score 0–10 |
 | 🔧 Hangar | Long answer, saved drafts, edits until closing | Staff score 0–10 |
 
@@ -32,10 +32,10 @@ Rewards (per league, per season): 1st 3,000 · 2nd 2,000 · 3rd 1,000 · 4th 800
 
 The database, not the bot process, owns anything that can race:
 
-- `ks_answer_points` derives earned points, including the first-correct bonus. The bonus is computed from the earliest eligible correct answer, so disqualifying that answer moves the bonus automatically instead of leaving it attached to a removed user. Knowledge answers are excluded from the view until their challenge closes, so open trivia results never leak into standings.
+- `ks_answer_points` derives earned points, including the first-correct bonus. The bonus is computed from the earliest eligible correct answer, so disqualifying that answer moves the bonus automatically instead of leaving it attached to a removed user. Trivia answers are excluded from the view until their challenge closes, so open trivia results never leak into standings.
 - `ks_standings` aggregates points, correct counts, the 10→0 score histogram, and staff tie-break values.
 - `ks_answer_action()` (save / submit / trivia) locks the season row, enforces the deadline, blocked participants, the 10-section / 2,000-word / 20,000-character limits, and version-stamps every submission into `ks_answer_versions`.
-- `ks_score_answer()` requires the reviewer's expected version, refuses self-scoring, refuses scoring before closing, and refuses to override a derived Knowledge score.
+- `ks_score_answer()` requires the reviewer's expected version, refuses self-scoring, refuses scoring before closing, and refuses to override a derived Trivia score.
 - `ks_finalize()` refuses while any valid answer is unscored, refuses unresolved top-10 ties, excludes departed members, and freezes awards as snapshots.
 - `ks_events` is the audit trail: score changes, wording corrections, cancellations, reward status changes.
 
@@ -77,7 +77,7 @@ The committed `package-lock.json` is required: the build step is `npm ci`.
 
 ## Tests
 
-`npm test` runs the scheduling and ranking helpers under `node --test` via tsx: IST Monday selection, the 24-slot four-week calendar, 4 PM IST openings, no Sunday openings, word counting, the draft limit, and Knowledge-vs-Strategy tie-break ordering.
+`npm test` runs the scheduling and ranking helpers under `node --test` via tsx: IST Monday selection, the 24-slot four-week calendar, 4 PM IST openings, no Sunday openings, word counting, the draft limit, and Trivia-vs-Strategy tie-break ordering.
 
 ## v1 limitations — read before a prize-bearing season
 

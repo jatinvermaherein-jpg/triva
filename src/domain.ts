@@ -7,7 +7,7 @@ export const LEAGUES: League[] = [
 ];
 
 export const LABELS: Record<League, string> = {
-  knowledge: "🧠 Knowledge League",
+  knowledge: "🧠 Trivia Challenge",
   strategy: "⚔️ Strategy Challenge",
   hangar: "🔧 Hangar Review"
 };

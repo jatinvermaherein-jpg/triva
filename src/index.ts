@@ -160,7 +160,7 @@ async function requireDatabase() {
   } catch (error: any) {
     if (isMissingSchemaError(error)) {
       throw new Error(
-        "The Knowledge Season tables are missing. Run sql/001_initial.sql " +
+        "The Trivia Season tables are missing. Run sql/001_initial.sql " +
         "in the Supabase SQL editor, then try /setup again."
       );
     }
@@ -426,7 +426,7 @@ async function stableSend(
     EmbedBuilder.from(e)
   );
 
-  if (!embeds.length) embeds.push(embed("Hub Knowledge", " "));
+  if (!embeds.length) embeds.push(embed("Hub Trivia", " "));
   embeds[0].setFooter({ text: marker });
 
   const hash = createHash("sha256").update(key).digest();
@@ -608,47 +608,128 @@ async function setupServer(staffRoleId: string) {
     throw new Error("Choose a dedicated staff role, not @everyone.");
   }
 
-  const publicCategory = await g.channels.create({
-    name: "HUB KNOWLEDGE",
-    type: ChannelType.GuildCategory
-  });
+  // Setup is idempotent and resumable. Channels and roles are tracked by
+  // their Discord snowflake IDs (never by name), so renaming a channel or
+  // category does not recreate anything and does not break routing. Recover
+  // any IDs saved by a prior (possibly partial) run first.
+  const prior = await db(
+    supabase.from("ks_config")
+      .select("*")
+      .eq("guild_id", GUILD_ID)
+      .maybeSingle()
+  ).catch(() => null);
 
-  const privateCategory = await g.channels.create({
-    name: "KNOWLEDGE STAFF",
-    type: ChannelType.GuildCategory,
-    permissionOverwrites: [
-      {
-        id: g.id,
-        deny: [PermissionFlagsBits.ViewChannel]
-      },
-      {
-        id: staffRoleId,
-        allow: [
-          PermissionFlagsBits.ViewChannel,
-          PermissionFlagsBits.SendMessages,
-          PermissionFlagsBits.ReadMessageHistory
-        ]
-      },
-      {
-        id: me.id,
-        allow: [
-          PermissionFlagsBits.ViewChannel,
-          PermissionFlagsBits.SendMessages,
-          PermissionFlagsBits.ReadMessageHistory,
-          PermissionFlagsBits.ManageChannels
-        ]
-      }
-    ]
-  });
+  const savedChannels: Record<string, string> = prior?.channels ?? {};
+  const savedBlockedRoleId: string | undefined = prior?.blocked_role_id;
 
-  const channels: Record<string, string> = {
-    publicCategory: publicCategory.id,
-    privateCategory: privateCategory.id
+  const channelById = async (id?: string): Promise<any | null> => {
+    if (!id) return null;
+    return g.channels.fetch(id).catch(() => null);
   };
 
+  const channelByName = async (
+    name: string,
+    type: ChannelType.GuildCategory | ChannelType.GuildText,
+    parentId?: string
+  ): Promise<any | null> => {
+    const all = await g.channels.fetch();
+    return all.find(c =>
+      c != null &&
+      c.name === name &&
+      c.type === type &&
+      (!parentId || c.parentId === parentId)
+    ) ?? null;
+  };
+
+  const findOrCreate = async (
+    key: string,
+    name: string,
+    type: ChannelType.GuildCategory | ChannelType.GuildText,
+    parentId?: string,
+    permissionOverwrites?: any[]
+  ): Promise<string> => {
+    const existing = (await channelById(savedChannels[key]))
+      ?? (await channelByName(name, type, parentId));
+
+    if (existing) return existing.id;
+
+    const created = await g.channels.create({
+      name,
+      type,
+      ...(parentId ? { parent: parentId } : {}),
+      ...(permissionOverwrites ? { permissionOverwrites } : {})
+    });
+
+    return created.id;
+  };
+
+  const privateCategoryOverwrites = [
+    {
+      id: g.id,
+      deny: [PermissionFlagsBits.ViewChannel]
+    },
+    {
+      id: staffRoleId,
+      allow: [
+        PermissionFlagsBits.ViewChannel,
+        PermissionFlagsBits.SendMessages,
+        PermissionFlagsBits.ReadMessageHistory
+      ]
+    },
+    {
+      id: me.id,
+      allow: [
+        PermissionFlagsBits.ViewChannel,
+        PermissionFlagsBits.SendMessages,
+        PermissionFlagsBits.ReadMessageHistory,
+        PermissionFlagsBits.ManageChannels
+      ]
+    }
+  ];
+
+  const publicCategoryId = await findOrCreate(
+    "publicCategory",
+    "HUB TRIVIA",
+    ChannelType.GuildCategory
+  );
+
+  const privateCategoryId = await findOrCreate(
+    "privateCategory",
+    "TRIVIA STAFF",
+    ChannelType.GuildCategory,
+    undefined,
+    privateCategoryOverwrites
+  );
+
+  const channels: Record<string, string> = {
+    publicCategory: publicCategoryId,
+    privateCategory: privateCategoryId
+  };
+
+  const publicOverwrites = [
+    {
+      id: g.id,
+      allow: [
+        PermissionFlagsBits.ViewChannel,
+        PermissionFlagsBits.ReadMessageHistory,
+        PermissionFlagsBits.SendMessagesInThreads,
+        PermissionFlagsBits.AttachFiles
+      ],
+      deny: [
+        PermissionFlagsBits.SendMessages,
+        PermissionFlagsBits.CreatePublicThreads,
+        PermissionFlagsBits.CreatePrivateThreads
+      ]
+    },
+    {
+      id: me.id,
+      allow: required
+    }
+  ];
+
   const publicNames: Record<string, string> = {
-    hub: "knowledge-hub",
-    knowledge: "knowledge-challenges",
+    hub: "trivia-hub",
+    knowledge: "trivia-challenges",
     strategy: "strategy-challenges",
     hangar: "hangar-challenges",
     strategyAnswers: "strategy-answers",
@@ -659,33 +740,13 @@ async function setupServer(staffRoleId: string) {
   };
 
   for (const [key, name] of Object.entries(publicNames)) {
-    const channel = await g.channels.create({
+    channels[key] = await findOrCreate(
+      key,
       name,
-      type: ChannelType.GuildText,
-      parent: publicCategory.id,
-      permissionOverwrites: [
-        {
-          id: g.id,
-          allow: [
-            PermissionFlagsBits.ViewChannel,
-            PermissionFlagsBits.ReadMessageHistory,
-            PermissionFlagsBits.SendMessagesInThreads,
-            PermissionFlagsBits.AttachFiles
-          ],
-          deny: [
-            PermissionFlagsBits.SendMessages,
-            PermissionFlagsBits.CreatePublicThreads,
-            PermissionFlagsBits.CreatePrivateThreads
-          ]
-        },
-        {
-          id: me.id,
-          allow: required
-        }
-      ]
-    });
-
-    channels[key] = channel.id;
+      ChannelType.GuildText,
+      publicCategoryId,
+      publicOverwrites
+    );
   }
 
   for (const [key, name] of Object.entries({
@@ -694,27 +755,42 @@ async function setupServer(staffRoleId: string) {
     hangarReview: "hangar-review",
     audit: "audit-logs"
   })) {
-    const channel = await g.channels.create({
+    channels[key] = await findOrCreate(
+      key,
       name,
-      type: ChannelType.GuildText,
-      parent: privateCategory.id
-    });
-    channels[key] = channel.id;
+      ChannelType.GuildText,
+      privateCategoryId
+    );
   }
 
-  const blockedRole = await g.roles.create({
-    name: "Knowledge — Nonparticipating",
-    permissions: [],
-    mentionable: false,
-    hoist: false
-  });
+  let blockedRole = savedBlockedRoleId
+    ? await g.roles.fetch(savedBlockedRoleId).catch(() => null)
+    : null;
+
+  if (!blockedRole) {
+    const allRoles = await g.roles.fetch();
+    blockedRole = allRoles.find(
+      r => r.name === "Trivia — Nonparticipating"
+    ) ?? null;
+  }
+
+  if (!blockedRole) {
+    blockedRole = await g.roles.create({
+      name: "Trivia — Nonparticipating",
+      permissions: [],
+      mentionable: false,
+      hoist: false
+    });
+  }
 
   await db(
-    supabase.from("ks_config").insert({
+    supabase.from("ks_config").upsert({
       guild_id: GUILD_ID,
       staff_role_id: staffRoleId,
       blocked_role_id: blockedRole.id,
       channels
+    }, {
+      onConflict: "guild_id"
     })
   );
 
@@ -729,9 +805,9 @@ function memberPanel() {
   return {
     embeds: [
       embed(
-        "🏆 Hub Knowledge Season",
+        "🏆 Hub Trivia Season",
         "Four-week seasons • Monday–Saturday • 4 PM IST\n\n" +
-        "Knowledge answers are private and final.\n" +
+        "Trivia answers are private and final.\n" +
         "Strategy and Hangar answers support saved drafts and edits " +
         "until closing.\n\n" +
         "Use the buttons below."
@@ -756,7 +832,7 @@ function staffPanel() {
   return {
     embeds: [
       embed(
-        "🛠️ Knowledge Staff Control",
+        "🛠️ Trivia Staff Control",
         "All scoring and moderation decisions remain staff-controlled.\n\n" +
         "Prepare question sets, mark them Ready, review closed answers, " +
         "and approve season results."
@@ -976,19 +1052,17 @@ async function workspace(i: any, challengeId: string) {
           c.prompt + "\n\n" +
           c.options.map((o: string, n: number) =>
             `**${String.fromCharCode(65 + n)}.** ${o}`
-          ).join("\n")
+          ).join("\n") +
+          "\n\n*Tap the option you think is correct, then submit it.*"
         )
       ],
-      components: [
-        row(select(
-          `choose:${c.id}`,
-          "Choose one answer",
-          c.options.map((o: string, n: number) => ({
-            label: `${String.fromCharCode(65 + n)}. ${o}`,
-            value: String(n)
-          }))
+      components: c.options.map((o: string, n: number) =>
+        row(button(
+          `choose:${c.id}:${n}`,
+          `${String.fromCharCode(65 + n)}. ${o.slice(0, 76)}`,
+          ButtonStyle.Primary
         ))
-      ]
+      )
     });
   }
 
@@ -1129,7 +1203,7 @@ async function createUploadRoom(i: any, challengeId: string) {
       type: ChannelType.PrivateThread,
       invitable: false,
       autoArchiveDuration: ThreadAutoArchiveDuration.OneDay,
-      reason: "Private Knowledge Season image workspace"
+      reason: "Private Trivia Season image workspace"
     });
 
     await thread.members.add(i.user.id);
@@ -1850,7 +1924,7 @@ async function workerCloseChallenges() {
               `Answer Revealed • ${c.title}`,
               `Correct answer: **${c.options[c.correct_index]}**\n\n` +
               "Scores and the first-correct bonus are now included " +
-              "in the Knowledge leaderboard."
+              "in the Trivia leaderboard."
             )
           ]
         }
@@ -2328,22 +2402,17 @@ client.on(Events.InteractionCreate, async (i: any) => {
       await requireStaff(i, true);
 
       if (i.commandName === "setup") {
-        if (config) {
-          return respond(
-            i,
-            "Setup already exists. Use /panels to recover panel messages. " +
-            "Renaming channels and roles does not require setup again."
-          );
-        }
-
         return respond(i, {
           embeds: [
             embed(
-              "Knowledge Season Setup",
+              "Trivia Season Setup",
               "Choose your trusted staff role.\n\n" +
               "The bot will create the channel layout, a Nonparticipating " +
               "role, and the panels. Season 1 starts automatically on " +
               "the next Monday at 00:00 IST. First challenges open at 4 PM.\n\n" +
+              "Setup is safe to re-run: every channel, category and role is " +
+              "tracked by its ID, so existing ones are reused and renamed " +
+              "channels are never recreated.\n\n" +
               "Do not run setup while another setup is in progress."
             )
           ],
@@ -2387,7 +2456,6 @@ client.on(Events.InteractionCreate, async (i: any) => {
 
     if (action === "setupRole") {
       await requireStaff(i, true);
-      if (config) throw new Error("Setup already completed.");
       if (setupRunning) throw new Error("Setup is already running.");
 
       setupRunning = true;
@@ -2882,21 +2950,31 @@ client.on(Events.InteractionCreate, async (i: any) => {
 
     if (action === "choose") {
       const c = await context(id);
-      const chosen = Number(i.values[0]);
+      await requireParticipant(i.user.id, c);
+
+      const chosen = Number(extra);
+
+      if (
+        !Number.isInteger(chosen) ||
+        chosen < 0 ||
+        chosen >= (c.options?.length ?? 0)
+      ) {
+        throw new Error("That option is no longer available. Reopen the question.");
+      }
 
       return respond(i, {
         embeds: [
           embed(
-            "Confirm Final Trivia Answer",
-            `**${c.options[chosen]}**\n\n` +
-            "This answer cannot be edited after confirmation."
+            "Submit Final Trivia Answer",
+            `**${String.fromCharCode(65 + chosen)}. ${c.options[chosen]}**\n\n` +
+            "This answer cannot be edited after submission."
           )
         ],
         components: [
           row(
             button(
               `confirm:${id}:${chosen}`,
-              "Confirm Final Answer",
+              "Submit Final Answer",
               ButtonStyle.Danger
             ),
             button(`work:${id}`, "Choose Again")
@@ -3338,11 +3416,11 @@ client.once(Events.ClientReady, async () => {
   const commands = [
     new SlashCommandBuilder()
       .setName("setup")
-      .setDescription("First-time Knowledge Season setup")
+      .setDescription("First-time Trivia Season setup")
       .setDefaultMemberPermissions(PermissionFlagsBits.Administrator),
     new SlashCommandBuilder()
       .setName("panels")
-      .setDescription("Recover Knowledge Season root panels")
+      .setDescription("Recover Trivia Season root panels")
       .setDefaultMemberPermissions(PermissionFlagsBits.Administrator)
   ];
 
